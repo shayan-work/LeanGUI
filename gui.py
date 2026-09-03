@@ -5,7 +5,7 @@ import pyqtgraph as pg
 import numpy as np
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLineEdit, QLabel, 
-                             QFileDialog, QDoubleSpinBox, QMessageBox, QComboBox)
+                             QFileDialog, QDoubleSpinBox, QMessageBox, QComboBox, QGridLayout, QFormLayout, QGroupBox)
 from PySide6.QtCore import QTimer, QThread, Signal
 from collections import deque
 
@@ -17,33 +17,6 @@ class ConstellationReader(QThread):
         super().__init__()
         self.read_fd = read_fd
         self.running = True
-    
-    '''
-    def run(self):
-        # Open the pipe file descriptor as a text stream
-        with os.fdopen(self.read_fd, 'r') as f:
-            batch = []
-            for line in f:
-                if not self.running:
-                    break
-                try:
-                    # leandvb streams lines like: {"i": 0.123, "q": -0.456, ...}
-                    data = json.loads(line)
-                    if 'i' in data and 'q' in data:
-                        batch.append((data['i'], data['q']))
-                        
-                        # Batching points (e.g., 20 at a time) reduces overhead 
-                        # on the GUI thread significantly!
-                        if len(batch) >= 20:
-                            self.new_points_signal.emit(batch)
-                            batch = []
-                except ValueError:
-                    continue  # Handle partial/malformed JSON strings gracefully
-            
-            # Flush out any remaining points at EOF
-            if batch:
-                self.new_points_signal.emit(batch)
-    '''
 
     def run(self):
         with os.fdopen(self.read_fd, 'r') as f:
@@ -69,11 +42,31 @@ class ConstellationReader(QThread):
     def stop(self):
         self.running = False
 
+class InfoReader(QThread):
+    new_line_signal = Signal(str)
+
+    def __init__(self, read_fd):
+        super().__init__()
+        self.read_fd = read_fd
+        self.running = True
+        self.unknown_info_lines = deque(maxlen=6)
+
+    def run(self):
+        with os.fdopen(self.read_fd, 'r') as f:
+            for line in f:
+                if not self.running:
+                    break
+                line = line.strip()
+                if line:
+                    self.new_line_signal.emit(line)
+
+    def stop(self):
+        self.running = False
 
 class SpectrumAnalyzerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SDR IQ Spectrum Analyzer (f32)")
+        self.setWindowTitle("LeanGUI : GUI Wrapper for leandvb)")
         self.resize(900, 600)
 
         # DSP Parameters
@@ -92,6 +85,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
         self.leandvb_process = None
         self.const_reader_thread = None
         self.mpv_process = None
+        self.info_reader_thread = None
         
         # Initialize GUI layout
         self.init_ui()
@@ -169,10 +163,8 @@ class SpectrumAnalyzerGUI(QMainWindow):
         control_layout.addWidget(self.decode_btn)
 
         main_layout.addLayout(control_layout)
-
-        plots_layout = QHBoxLayout() # Horizontal layout to hold both plots
-
-        # --- Left: Spectrum Plot ---
+        
+        # --- Spectrum Plot ---
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setBackground('k')
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
@@ -182,36 +174,66 @@ class SpectrumAnalyzerGUI(QMainWindow):
         self.plot_widget.setYRange(-80, 20)
         self.plot_widget.enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)
         self.curve = self.plot_widget.plot(pen=pg.mkPen('c', width=1.5))
-        plots_layout.addWidget(self.plot_widget, stretch=2) # Take up 2/3 of space
 
-        # --- Right: Constellation Plot ---
+        # --- Constellation Plot ---
         self.const_widget = pg.PlotWidget()
         self.const_widget.setBackground('k')
         self.const_widget.showGrid(x=True, y=True, alpha=0.3)
         self.const_widget.setLabel('left', 'Quadrature (Q)')
         self.const_widget.setLabel('bottom', 'In-Phase (I)')
         self.const_widget.setTitle('Synchronized Symbols')
-        
+
         # Keep the grid square so circles/constellations aren't skewed
         self.const_widget.setAspectLocked(True)
         self.const_widget.enableAutoRange(axis=pg.ViewBox.XYAxes, enable=True)
-        
+
         # Use ScatterPlotItem for high speed
         self.const_scatter = pg.ScatterPlotItem(
-            size=4, 
-            pen=None, 
-            brush=pg.mkBrush(0, 255, 100, 120) 
+            size=4,
+            pen=None,
+            brush=pg.mkBrush(0, 255, 100, 120)
         )
         self.const_widget.addItem(self.const_scatter)
-        plots_layout.addWidget(self.const_widget, stretch=1) # Take up 1/3 of space
-        
-        main_layout.addLayout(plots_layout)
-        
-        # --- Video Output Panel (mpv embeds here via X11 window id) ---
+
+         # --- Info panel (bottom-left) ---
+        self.info_panel = QGroupBox("Demodulator Status")
+        info_layout = QFormLayout()
+
+        self.lock_label = QLabel("—")
+        self.ss_label = QLabel("—")
+        self.mer_label = QLabel("—")
+        self.ber_label = QLabel("—")
+        self.offset_label = QLabel("—")
+        self.modcod_label = QLabel("—")
+        self.error_label = QLabel("—")
+        self.error_label.setWordWrap(True)
+
+        info_layout.addRow("Lock Status:", self.lock_label)
+        info_layout.addRow("Signal Strength:", self.ss_label)
+        info_layout.addRow("MER:", self.mer_label)
+        info_layout.addRow("BER:", self.ber_label)
+        info_layout.addRow("Freq Offset:", self.offset_label)
+        info_layout.addRow("MODCOD:", self.modcod_label)
+        info_layout.addRow("Errors:", self.error_label)
+
+        self.info_panel.setLayout(info_layout)
+
+        # --- Video output panel (bottom-right, mpv embeds via X11 window id) ---
         self.video_widget = QWidget()
         self.video_widget.setStyleSheet("background-color: black;")
         self.video_widget.setMinimumHeight(280)
-        main_layout.addWidget(self.video_widget)
+
+        # --- 2x2 grid: spectrum | constellation / info | video ---
+        content_grid = QGridLayout()
+        content_grid.addWidget(self.plot_widget, 0, 0)
+        content_grid.addWidget(self.const_widget, 0, 1)
+        content_grid.addWidget(self.info_panel, 1, 0)
+        content_grid.addWidget(self.video_widget, 1, 1)
+        content_grid.setRowStretch(0, 1)
+        content_grid.setRowStretch(1, 1)
+        content_grid.setColumnStretch(0, 1)
+        content_grid.setColumnStretch(1, 1)
+        main_layout.addLayout(content_grid)
         
         
         # Shaded region representing occupied bandwidth (BW = Rs * (1 + alpha))
@@ -272,6 +294,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
 
         # 1. Create a Unix pipe specifically for the constellation data
         r_fd, w_fd = os.pipe()
+        info_r_fd, info_w_fd = os.pipe()
 
         # 2. Build the leandvb command line
         cmd = [
@@ -284,6 +307,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
             '--standard', 'DVB-S2',
             '--ldpc-helper', 'ldpc_tool', # Assumes ldpc_tool is in your system PATH
             '--fd-const', f"{w_fd}",    # Instruct leandvb to write symbols to our pipe write-end
+            '--fd-info', f"{info_w_fd}",
             '--json'                    # Tells leandvb to format outputs as easy-to-parse JSON
         ]
         
@@ -303,8 +327,11 @@ class SpectrumAnalyzerGUI(QMainWindow):
                 cmd,
                 stdin=self.iq_file_stream,
                 stdout=subprocess.PIPE,   # TS stream, now consumed by mpv
-                pass_fds=[w_fd]
+                pass_fds=[w_fd, info_w_fd]
             )
+            os.close(w_fd)
+            os.close(info_w_fd)
+    
 
             # 4b. Spawn mpv, embedded into video_widget via its X11 window id
             self.mpv_process = subprocess.Popen(
@@ -322,19 +349,44 @@ class SpectrumAnalyzerGUI(QMainWindow):
             self.leandvb_process.stdout.close()
             
 
-            # We must close the write descriptor in the parent process so it gets 
-            # an EOF (broken pipe signal) when leandvb exits
-            os.close(w_fd)
 
             # 5. Start the background thread reading from the read descriptor
             self.const_reader_thread = ConstellationReader(r_fd)
             self.const_reader_thread.new_points_signal.connect(self.update_constellation_plot)
             self.const_reader_thread.start()
+            
+            self.info_reader_thread = InfoReader(info_r_fd)
+            self.info_reader_thread.new_line_signal.connect(self.update_info_line)
+            self.info_reader_thread.start()
 
         except Exception as e:
             QMessageBox.critical(self, "Process Error", f"Failed to start leandvb:\n{str(e)}")
             self.stop_decoding()
 
+    def update_info_line(self, line):
+        parts = line.split(maxsplit=1)
+        if not parts:
+            return
+        keyword = parts[0]
+        value = parts[1].strip() if len(parts) > 1 else ""
+
+        if keyword == "FRAMELOCK":
+            self.lock_label.setText("LOCKED" if value == "1" else "NOT LOCKED")
+        elif keyword == "SS":
+            self.ss_label.setText(value)
+        elif keyword == "MER":
+            self.mer_label.setText(value)
+        elif keyword == "VBER":
+            self.ber_label.setText(value)
+        elif keyword == "FREQ":
+            self.offset_label.setText(value)
+        elif keyword == "MODCOD":
+            self.modcod_label.setText(value)
+        else:
+            # Unmapped keyword - surface it instead of guessing/discarding
+            self.unknown_info_lines.append(line)
+            self.error_label.setText("\n".join(self.unknown_info_lines))
+    
     def update_constellation_plot(self, points):
         #print(f"got {len(points)} points, e.g. {points[0]}")
         # Unpack the batch and append to our rolling FIFO queues
@@ -370,6 +422,11 @@ class SpectrumAnalyzerGUI(QMainWindow):
         if hasattr(self, 'iq_file_stream') and self.iq_file_stream:
             self.iq_file_stream.close()
             self.iq_file_stream = None
+            
+        if self.info_reader_thread:
+            self.info_reader_thread.stop()
+            self.info_reader_thread.wait()
+            self.info_reader_thread = None
 
     def update_tuning_bars(self):
         # Safety guard to prevent crash on startup when widgets trigger signals
