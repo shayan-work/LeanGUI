@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import re
 import pyqtgraph as pg
 import numpy as np
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
@@ -63,6 +64,26 @@ class InfoReader(QThread):
     def stop(self):
         self.running = False
 
+class StderrReader(QThread):
+    new_line_signal = Signal(str)
+
+    def __init__(self, stream):
+        super().__init__()
+        self.stream = stream
+        self.running = True
+
+    def run(self):
+        for line in self.stream:
+            if not self.running:
+                break
+            line = line.decode('utf-8', errors='replace').strip()
+            line = re.sub(r'[_.C!]{3,}', '', line).strip()
+            if line:
+                self.new_line_signal.emit(line)
+
+    def stop(self):
+        self.running = False
+
 class SpectrumAnalyzerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -87,6 +108,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
         self.const_reader_thread = None
         self.mpv_process = None
         self.info_reader_thread = None
+        self.stderr_reader_thread = None
         
         # Initialize GUI layout
         self.init_ui()
@@ -215,7 +237,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
         info_layout.addRow("BER:", self.ber_label)
         info_layout.addRow("Freq Offset:", self.offset_label)
         info_layout.addRow("MODCOD:", self.modcod_label)
-        info_layout.addRow("Errors:", self.error_label)
+        info_layout.addRow("Debug Info:", self.error_label)
 
         self.info_panel.setLayout(info_layout)
 
@@ -329,6 +351,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
                 cmd,
                 stdin=self.iq_file_stream,
                 stdout=subprocess.PIPE,   # TS stream, now consumed by mpv
+                stderr=subprocess.PIPE,
                 pass_fds=[w_fd, info_w_fd]
             )
             os.close(w_fd)
@@ -360,6 +383,10 @@ class SpectrumAnalyzerGUI(QMainWindow):
             self.info_reader_thread = InfoReader(info_r_fd)
             self.info_reader_thread.new_line_signal.connect(self.update_info_line)
             self.info_reader_thread.start()
+            
+            self.stderr_reader_thread = StderrReader(self.leandvb_process.stderr)
+            self.stderr_reader_thread.new_line_signal.connect(self.update_stderr_line)
+            self.stderr_reader_thread.start()
 
         except Exception as e:
             QMessageBox.critical(self, "Process Error", f"Failed to start leandvb:\n{str(e)}")
@@ -429,6 +456,11 @@ class SpectrumAnalyzerGUI(QMainWindow):
             self.info_reader_thread.stop()
             self.info_reader_thread.wait()
             self.info_reader_thread = None
+            
+        if self.stderr_reader_thread:
+            self.stderr_reader_thread.stop()
+            self.stderr_reader_thread.wait()
+            self.stderr_reader_thread = None
 
     def update_tuning_bars(self):
         # Safety guard to prevent crash on startup when widgets trigger signals
@@ -469,7 +501,37 @@ class SpectrumAnalyzerGUI(QMainWindow):
         # 7. Update graph overlays
         self.tuning_region.setRegion([f_min, f_max])
         self.center_line.setValue(fc_hz)
-
+    
+    def update_stderr_line(self, line):
+        MODCOD_TABLE = {
+            1: "QPSK1/4", 2: "QPSK1/3", 3: "QPSK2/5", 4: "QPSK1/2", 5: "QPSK3/5",
+            6: "QPSK2/3", 7: "QPSK3/4", 8: "QPSK4/5", 9: "QPSK5/6", 10: "QPSK8/9",
+            11: "QPSK9/10", 12: "8PSK3/5", 13: "8PSK2/3", 14: "8PSK3/4", 15: "8PSK5/6",
+            16: "8PSK8/9", 17: "8PSK9/10", 18: "16APSK2/3", 19: "16APSK3/4",
+            20: "16APSK4/5", 21: "16APSK5/6", 22: "16APSK8/9", 23: "16APSK9/10",
+            24: "32APSK3/4", 25: "32APSK4/5", 26: "32APSK5/6", 27: "32APSK8/9",
+            28: "32APSK9/10",
+        }
+        m = re.match(r"Spawning LDPC helper: modcod=(\d+)", line)
+        if m:
+            modcod_num = int(m.group(1))
+            self.modcod_label.setText(MODCOD_TABLE.get(modcod_num, f"Unknown MODCOD {modcod_num}"))
+        else:
+            self.unknown_info_lines.append(line)
+            self.error_label.setText("\n".join(self.unknown_info_lines))
+  #          self.error_label.verticalScrollBar().setValue(
+   #             self.error_label.verticalScrollBar().maximum()
+    #        )
+        
+    '''    
+    def update_stderr_line(self, line):
+        if line.startswith("Creating LUT for"):
+            self.modcod_label.setText(line[len("Creating LUT for "):])
+        else:
+            self.unknown_info_lines.append(line)
+            self.error_label.setText("\n".join(self.unknown_info_lines))
+    '''
+    
     def browse_file(self):
         filepath, _ = QFileDialog.getOpenFileName(self, "Open IQ File", "")
         if filepath:
