@@ -528,9 +528,6 @@ class SpectrumAnalyzerGUI(QMainWindow):
         f_min, f_max = self.tuning_region.getRegion()
         line0, line1 = self.tuning_region.lines
         edge_dragging = getattr(line0, 'moving', False) or getattr(line1, 'moving', False)
-        print(f"DEBUG drag: edge_dragging={edge_dragging} "
-              f"line0.moving={getattr(line0, 'moving', '?')} "
-              f"line1.moving={getattr(line1, 'moving', '?')}")
 
         try:
             beta = float(self.rolloff_combo.currentText())
