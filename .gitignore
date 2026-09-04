@@ -1,6 +1,7 @@
 # Ignore test files
 DVBS2_SPS*
 output*
+Test Signals/
 
 # Ignore the virtual environment directory and all its contents
 .venv/

@@ -120,6 +120,8 @@ class SpectrumAnalyzerGUI(QMainWindow):
         self.const_timer = QTimer()
         self.const_timer.timeout.connect(self.redraw_constellation)
         self.const_timer.start(33)  # same 30fps cadence as the spectrum plot
+        
+        self._updating_tuning_ui = False
 
     def redraw_constellation(self):
         self.const_scatter.setData(x=list(self.i_buffer), y=list(self.q_buffer))
@@ -268,6 +270,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
         )
         self.tuning_region.setMovable(False) 
         self.plot_widget.addItem(self.tuning_region)
+        self.tuning_region.setMovable(True)
 
         # Dashed white line indicating exact center frequency (offset)
         self.center_line = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen('w', style=pg.QtCore.Qt.DashLine))
@@ -280,6 +283,8 @@ class SpectrumAnalyzerGUI(QMainWindow):
 
         # Run an initial update calculation to draw default positions on open
         self.update_tuning_bars()
+        self._updating_tuning_ui = False
+        self.tuning_region.sigRegionChanged.connect(self.on_tuning_region_dragged)
 
     def toggle_decoding(self):
         if self.leandvb_process:
@@ -304,6 +309,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
         self.i_buffer.clear()
         self.q_buffer.clear()
         self.const_scatter.clear()
+        self.modcod_label.setText("—")
 
         # Parse tuning configuration parameters
         try:
@@ -457,6 +463,12 @@ class SpectrumAnalyzerGUI(QMainWindow):
             self.info_reader_thread.wait()
             self.info_reader_thread = None
             
+        self.lock_label.setText("—")
+        self.ss_label.setText("—")
+        self.mer_label.setText("—")
+        self.ber_label.setText("—")
+        self.offset_label.setText("—")
+            
         if self.stderr_reader_thread:
             self.stderr_reader_thread.stop()
             self.stderr_reader_thread.wait()
@@ -499,8 +511,38 @@ class SpectrumAnalyzerGUI(QMainWindow):
         f_max = fc_hz + (bw_hz / 2.0)
 
         # 7. Update graph overlays
-        self.tuning_region.setRegion([f_min, f_max])
-        self.center_line.setValue(fc_hz)
+        self._updating_tuning_ui = True
+        try:
+            self.tuning_region.setRegion([f_min, f_max])
+            self.center_line.setValue(fc_hz)
+        finally:
+            self._updating_tuning_ui = False
+            
+    def on_tuning_region_dragged(self):
+        if self._updating_tuning_ui:
+            return  # this change came from our own code, not a mouse drag
+
+        f_min, f_max = self.tuning_region.getRegion()
+        line0, line1 = self.tuning_region.lines
+        edge_dragging = getattr(line0, 'moving', False) or getattr(line1, 'moving', False)
+        print(f"DEBUG drag: edge_dragging={edge_dragging} "
+              f"line0.moving={getattr(line0, 'moving', '?')} "
+              f"line1.moving={getattr(line1, 'moving', '?')}")
+
+        try:
+            beta = float(self.rolloff_combo.currentText())
+        except ValueError:
+            beta = 0.25
+
+        if edge_dragging:
+            # Red bar drag -> symbol rate. update_tuning_bars() will
+            # re-symmetrize the region around the current center for us.
+            rs_hz = (f_max - f_min) / (1 + beta)
+            self.symbol_rate_edit.setText(f"{max(rs_hz / 1e6, 0.001):.3f}")
+        else:
+            # Box body drag -> offset. Width is already preserved natively.
+            fc_hz = (f_min + f_max) / 2.0
+            self.center_freq_edit.setText(f"{fc_hz / 1e6:.4f}")
     
     def update_stderr_line(self, line):
         MODCOD_TABLE = {
