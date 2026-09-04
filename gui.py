@@ -87,7 +87,7 @@ class StderrReader(QThread):
 class SpectrumAnalyzerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("LeanGUI : GUI Wrapper for leandvb)")
+        self.setWindowTitle("LeanGUI : GUI Wrapper for leandvb")
         self.resize(900, 600)
 
         # DSP Parameters
@@ -336,6 +336,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
             '--derotate', f"{int(fc_mhz * 1e6)}",
             '--standard', 'DVB-S2',
             '--ldpc-helper', 'ldpc_tool', # Assumes ldpc_tool is in your system PATH
+            '--hq',
             '--fd-const', f"{w_fd}",    # Instruct leandvb to write symbols to our pipe write-end
             '--fd-info', f"{info_w_fd}",
             '--json'                    # Tells leandvb to format outputs as easy-to-parse JSON
