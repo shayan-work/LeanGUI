@@ -49,7 +49,7 @@ class InfoReader(QThread):
         super().__init__()
         self.read_fd = read_fd
         self.running = True
-        self.unknown_info_lines = deque(maxlen=6)
+        #self.unknown_info_lines = deque(maxlen=6)
 
     def run(self):
         with os.fdopen(self.read_fd, 'r') as f:
@@ -80,6 +80,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
         self.const_history_size = 1000
         self.i_buffer = deque(maxlen=self.const_history_size)
         self.q_buffer = deque(maxlen=self.const_history_size)
+        self.unknown_info_lines = deque(maxlen=6)
         
         # References to manage our background processes
         self.leandvb_process = None
@@ -304,6 +305,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
             '--f32',                    # 32-bit floating point complex input
             '-f', f"{int(samp_rate_hz)}",
             '--sr', f"{int(rs_msps * 1e6)}",
+            '--derotate', f"{int(fc_mhz * 1e6)}",
             '--standard', 'DVB-S2',
             '--ldpc-helper', 'ldpc_tool', # Assumes ldpc_tool is in your system PATH
             '--fd-const', f"{w_fd}",    # Instruct leandvb to write symbols to our pipe write-end
