@@ -2,6 +2,9 @@ import sys
 import os
 import json
 import re
+import select
+import time
+import subprocess
 import pyqtgraph as pg
 import numpy as np
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
@@ -83,6 +86,107 @@ class StderrReader(QThread):
 
     def stop(self):
         self.running = False
+        
+class SymbolRateSearchThread(QThread):
+    progress_signal = Signal(str)
+    found_signal = Signal(float)
+    failed_signal = Signal()
+
+    def __init__(self, iq_path, samp_rate_hz, rs_estimate_msps, trial_timeout_s=2.0):
+        super().__init__()
+        self.iq_path = iq_path
+        self.samp_rate_hz = samp_rate_hz
+        self.rs_estimate_msps = rs_estimate_msps
+        self.trial_timeout_s = trial_timeout_s
+        self.running = True
+
+    def run(self):
+        # Relative offsets around the spectral estimate, tightest first
+        deltas_pct = [0.0, 0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 5.0, -5.0]
+        for i, pct in enumerate(deltas_pct):
+            if not self.running:
+                return
+            candidate = self.rs_estimate_msps * (1.0 + pct / 100.0)
+            self.progress_signal.emit(
+                f"Trying {candidate:.3f} Msym/s ({i + 1}/{len(deltas_pct)})..."
+            )
+            if self._try_symbol_rate(candidate):
+                self.found_signal.emit(candidate)
+                return
+        self.failed_signal.emit()
+
+    def _try_symbol_rate(self, rs_msps):
+        info_r_fd, info_w_fd = os.pipe()
+
+        cmd = [
+            './leandvb', '-v', '-d', '--f32',
+            '-f', f"{int(self.samp_rate_hz)}",
+            '--sr', f"{int(rs_msps * 1e6)}",
+            '--standard', 'DVB-S2',
+            '--ldpc-helper', 'ldpc_tool',
+            '--fd-info', f"{info_w_fd}",
+        ]
+        try:
+            f = open(self.iq_path, 'rb')
+        except OSError:
+            os.close(info_r_fd)
+            os.close(info_w_fd)
+            return False
+
+        proc = subprocess.Popen(
+            cmd, stdin=f, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            pass_fds=[info_w_fd]
+        )
+        f.close()
+        os.close(info_w_fd)
+
+        current_lock = False
+        current_vber = None
+        consecutive_good = 0
+        required_consecutive = 3
+        vber_threshold = 0.01
+        locked_confirmed = False
+
+        deadline = time.time() + self.trial_timeout_s
+        info_stream = os.fdopen(info_r_fd, 'r')
+        try:
+            while time.time() < deadline and self.running:
+                remaining = deadline - time.time()
+                ready, _, _ = select.select([info_stream], [], [], max(remaining, 0))
+                if not ready:
+                    break
+                line = info_stream.readline()
+                if not line:
+                    break
+                parts = line.strip().split(maxsplit=1)
+                if not parts:
+                    continue
+                keyword = parts[0]
+                value = parts[1].strip() if len(parts) > 1 else ""
+
+                if keyword == "FRAMELOCK":
+                    current_lock = (value == "1")
+                elif keyword == "VBER":
+                    try:
+                        current_vber = float(value)
+                    except ValueError:
+                        current_vber = None
+
+                good_now = current_lock and current_vber is not None and current_vber <= vber_threshold
+                consecutive_good = consecutive_good + 1 if good_now else 0
+                if consecutive_good >= required_consecutive:
+                    locked_confirmed = True
+                    break
+        finally:
+            info_stream.close()
+            proc.terminate()
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+        return locked_confirmed
 
 class SpectrumAnalyzerGUI(QMainWindow):
     def __init__(self):
@@ -109,6 +213,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
         self.mpv_process = None
         self.info_reader_thread = None
         self.stderr_reader_thread = None
+        self.autotune_thread = None
         
         # Initialize GUI layout
         self.init_ui()
@@ -186,8 +291,15 @@ class SpectrumAnalyzerGUI(QMainWindow):
         self.decode_btn.setStyleSheet("background-color: blue; color: white;")
         self.decode_btn.clicked.connect(self.toggle_decoding)
         control_layout.addWidget(self.decode_btn)
+        
+        self.autotune_btn = QPushButton("Auto-Tune Rs")
+        self.autotune_btn.clicked.connect(self.start_autotune)
+        control_layout.addWidget(self.autotune_btn)
 
         main_layout.addLayout(control_layout)
+        
+        self.autotune_status_label = QLabel("")
+        main_layout.addWidget(self.autotune_status_label)
         
         # --- Spectrum Plot ---
         self.plot_widget = pg.PlotWidget()
@@ -285,6 +397,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
         self.update_tuning_bars()
         self._updating_tuning_ui = False
         self.tuning_region.sigRegionChanged.connect(self.on_tuning_region_dragged)
+        self.tuning_region.sigRegionChangeFinished.connect(self.estimate_symbol_rate_from_spectrum)
 
     def toggle_decoding(self):
         if self.leandvb_process:
@@ -344,7 +457,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
             '--json'                    # Tells leandvb to format outputs as easy-to-parse JSON
         ]
         
-        QTimer.singleShot(2000, lambda: print("leandvb alive:", self.leandvb_process.poll() is None))
+        #QTimer.singleShot(2000, lambda: print("leandvb alive:", self.leandvb_process.poll() is None))
 
         try:
             # 3. Open the file to pipe into stdin
@@ -543,6 +656,96 @@ class SpectrumAnalyzerGUI(QMainWindow):
             # Box body drag -> offset. Width is already preserved natively.
             fc_hz = (f_min + f_max) / 2.0
             self.center_freq_edit.setText(f"{fc_hz / 1e6:.4f}")
+
+    def start_autotune(self):
+        self.estimate_symbol_rate_from_spectrum()  # get a Stage-1 starting point first
+
+        iq_path = self.file_path_input.text()
+        if not iq_path or not os.path.exists(iq_path):
+            QMessageBox.warning(self, "Error", "Please select a valid IQ file.")
+            return
+
+        try:
+            rs_estimate = float(self.symbol_rate_edit.text().strip())
+        except ValueError:
+            QMessageBox.warning(self, "Error", "Symbol rate estimate is invalid.")
+            return
+
+        samp_rate_hz = self.samp_rate_spin.value() * 1e6
+
+        self.autotune_btn.setEnabled(False)
+        self.autotune_status_label.setText("Starting auto-tune...")
+
+        self.autotune_thread = SymbolRateSearchThread(iq_path, samp_rate_hz, rs_estimate)
+        self.autotune_thread.progress_signal.connect(self.autotune_status_label.setText)
+        self.autotune_thread.found_signal.connect(self.on_autotune_found)
+        self.autotune_thread.failed_signal.connect(self.on_autotune_failed)
+        self.autotune_thread.start()
+
+    def on_autotune_found(self, rs_msps):
+        self.symbol_rate_edit.setText(f"{rs_msps:.3f}")
+        self.autotune_status_label.setText(f"Locked at {rs_msps:.3f} Msym/s")
+        self.autotune_btn.setEnabled(True)
+
+    def on_autotune_failed(self):
+        self.autotune_status_label.setText("Auto-tune failed - no candidate locked.")
+        self.autotune_btn.setEnabled(True)
+            
+    def estimate_symbol_rate_from_spectrum(self):
+        if self._updating_tuning_ui:
+            return
+
+        iq_path = self.file_path_input.text()
+        if not iq_path or not os.path.exists(iq_path):
+            QMessageBox.warning(self, "Error", "Please select a valid IQ file first.")
+            return
+
+        sample_rate_hz = self.samp_rate_spin.value() * 1e6
+        f_min, f_max = self.tuning_region.getRegion()
+        fc_hz = (f_min + f_max) / 2.0
+        rough_bw_hz = max(f_max - f_min, 500e3)  # only used to isolate from neighbors
+
+        # 1. Read a large raw IQ chunk - needs many symbol periods for a clean line
+        N = 1 << 20  # ~1M complex samples (~87ms at 12 MSPS)
+        raw = np.fromfile(iq_path, dtype=np.complex64, count=N)
+        if len(raw) < 4096:
+            QMessageBox.warning(self, "Error", "Not enough samples read from file.")
+            return
+
+        # 2. Mix the carrier of interest down to baseband
+        n = np.arange(len(raw))
+        mixed = raw * np.exp(-1j * 2 * np.pi * fc_hz * n / sample_rate_hz)
+
+        # 3. Rough brick-wall filter to isolate it from other carriers -
+        #    generous width, doesn't need a precise drag
+        X = np.fft.fft(mixed)
+        freqs_full = np.fft.fftfreq(len(mixed), d=1.0 / sample_rate_hz)
+        half_bw = max(rough_bw_hz * 1.5, 750e3)
+        X[np.abs(freqs_full) > half_bw] = 0
+        filtered = np.fft.ifft(X)
+
+        # 4. Instantaneous power strips modulation, exposing the symbol-rate ripple
+        power = np.abs(filtered) ** 2
+        power = power - power.mean()
+
+        # 5. FFT of the power waveform - the peak IS the symbol rate
+        P = np.abs(np.fft.fft(power))
+        freqs_p = np.fft.fftfreq(len(power), d=1.0 / sample_rate_hz)
+
+        min_rs, max_rs = 100e3, min(sample_rate_hz / 2, 10e6)
+        mask = (freqs_p > min_rs) & (freqs_p < max_rs)
+        if not np.any(mask):
+            return
+        candidate_idx = np.where(mask)[0]
+        peak_idx = candidate_idx[np.argmax(P[candidate_idx])]
+        rs_hz = freqs_p[peak_idx]
+
+        self._updating_tuning_ui = True
+        try:
+            self.symbol_rate_edit.setText(f"{max(rs_hz / 1e6, 0.001):.3f}")
+        finally:
+            self._updating_tuning_ui = False
+        
     
     def update_stderr_line(self, line):
         MODCOD_TABLE = {
