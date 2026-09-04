@@ -103,7 +103,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
         self.q_buffer = deque(maxlen=self.const_history_size)
         self.unknown_info_lines = deque(maxlen=6)
         
-        # References to manage our background processes
+        # References to manage our background p rocesses
         self.leandvb_process = None
         self.const_reader_thread = None
         self.mpv_process = None
@@ -317,6 +317,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
             rs_msps = float(self.symbol_rate_edit.text().strip())
             # Default sample rate from spin box (scale to Hz)
             samp_rate_hz = self.samp_rate_spin.value() * 1e6 
+            beta = float(self.rolloff_combo.currentText())
         except ValueError:
             QMessageBox.warning(self, "Invalid Parameters", "Please check your tuning parameters.")
             return
@@ -334,6 +335,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
             '-f', f"{int(samp_rate_hz)}",
             '--sr', f"{int(rs_msps * 1e6)}",
             '--derotate', f"{int(fc_mhz * 1e6)}",
+            '--roll-off', f"{beta}",
             '--standard', 'DVB-S2',
             '--ldpc-helper', 'ldpc_tool', # Assumes ldpc_tool is in your system PATH
             '--hq',
