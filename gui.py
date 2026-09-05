@@ -202,6 +202,8 @@ class SpectrumAnalyzerGUI(QMainWindow):
         self.plot_widget.setYRange(-80, 20)
         self.plot_widget.enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)
         self.curve = self.plot_widget.plot(pen=pg.mkPen('c', width=1.5))
+        self.snr_text = pg.TextItem(text="SNR: -- dB", color='w', anchor=(0, 1))
+        self.plot_widget.addItem(self.snr_text, ignoreBounds=True)
 
         # --- Constellation Plot ---
         self.const_widget = pg.PlotWidget()
@@ -513,6 +515,32 @@ class SpectrumAnalyzerGUI(QMainWindow):
         finally:
             self._updating_tuning_ui = False
 
+    def update_snr_display(self):
+        if self.avg_psd is None:
+            return
+
+        sample_rate_hz = self.samp_rate_spin.value() * 1e6
+        freqs = np.fft.fftshift(np.fft.fftfreq(self.fft_size, d=1.0 / sample_rate_hz))
+
+        f_min, f_max = self.tuning_region.getRegion()
+        in_region = (freqs >= f_min) & (freqs <= f_max)
+        if not np.any(in_region):
+            self.snr_text.setText("SNR: -- dB")
+            return
+
+        signal_db = np.max(self.avg_psd[in_region])
+        outside_psd = self.avg_psd[~in_region]
+        noise_floor_db = np.median(outside_psd) if len(outside_psd) else self.avg_psd.min()
+        snr_db = signal_db - noise_floor_db
+        self.snr_text.setText(f"SNR: {snr_db:.1f} dB")
+
+        # Pin to the top-left corner regardless of zoom/pan
+        vb = self.plot_widget.getViewBox()
+        (xmin, xmax), (ymin, ymax) = vb.viewRange()
+        margin_x = 0.02 * (xmax - xmin)
+        margin_y = 0.05 * (ymax - ymin)
+        self.snr_text.setPos(xmin + margin_x, ymax - margin_y)
+
     def on_tuning_region_dragged(self):
         if self._updating_tuning_ui:
             return  # this change came from our own code, not a mouse drag
@@ -702,6 +730,9 @@ class SpectrumAnalyzerGUI(QMainWindow):
 
         # 6. Push data straight to the PyQtGraph curve
         self.curve.setData(freqs, self.avg_psd)
+        
+        self.curve.setData(freqs, self.avg_psd)
+        self.update_snr_display()
 
     def closeEvent(self, event):
         self.stop_plotting()
