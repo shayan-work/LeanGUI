@@ -12,6 +12,17 @@ from PySide6.QtCore import QTimer, QThread, Signal
 from collections import deque
 
 
+MODCOD_TABLE = {
+    1: "QPSK1/4", 2: "QPSK1/3", 3: "QPSK2/5", 4: "QPSK1/2", 5: "QPSK3/5",
+    6: "QPSK2/3", 7: "QPSK3/4", 8: "QPSK4/5", 9: "QPSK5/6", 10: "QPSK8/9",
+    11: "QPSK9/10", 12: "8PSK3/5", 13: "8PSK2/3", 14: "8PSK3/4", 15: "8PSK5/6",
+    16: "8PSK8/9", 17: "8PSK9/10", 18: "16APSK2/3", 19: "16APSK3/4",
+    20: "16APSK4/5", 21: "16APSK5/6", 22: "16APSK8/9", 23: "16APSK9/10",
+    24: "32APSK3/4", 25: "32APSK4/5", 26: "32APSK5/6", 27: "32APSK8/9",
+    28: "32APSK9/10",
+}
+
+
 class ConstellationReader(QThread):
     # Signal to send parsed (I, Q) points back to the main GUI thread
     new_points_signal = Signal(list)  # Sends a batch of [i, q] points
@@ -54,7 +65,6 @@ class InfoReader(QThread):
         super().__init__()
         self.read_fd = read_fd
         self.running = True
-        #self.unknown_info_lines = deque(maxlen=6)
 
     def run(self):
         with os.fdopen(self.read_fd, 'r') as f:
@@ -145,7 +155,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
         control_layout.addWidget(QLabel("IQ File (.iq / .raw):"))
         self.file_path_input = QLineEdit()
         self.file_path_input.setPlaceholderText("Select a 32-bit float complex IQ file...")
-        self.file_path_input.setText("/home/eocs/LeanGUI/DVBS2_SPS8_8PSK34_12MSPS_1_5MSymRate_noOffset_RRC")
+        self.file_path_input.setText("/home/eocs/LeanGUI/Test Signals/composite_signal_noisy")
         self.file_path_input.editingFinished.connect(
             lambda: self.start_plotting(self.file_path_input.text())
         )
@@ -422,14 +432,12 @@ class SpectrumAnalyzerGUI(QMainWindow):
             self.error_label.setText("\n".join(self.unknown_info_lines))
 
     def update_constellation_plot(self, points):
-        #print(f"got {len(points)} points, e.g. {points[0]}")
         # Unpack the batch and append to our rolling FIFO queues
         for i, q in points:
             self.i_buffer.append(i)
             self.q_buffer.append(q)
-        # Re-plot the rolling window
-        #self.const_scatter.setData(x=list(self.i_buffer), y=list(self.q_buffer))
-        #self.const_widget.enableAutoRange(axis=pg.ViewBox.XYAxes, enable=True)
+        # Actual redraw happens in redraw_constellation(), decoupled onto
+        # const_timer so a fast file doesn't queue up excessive redraws.
 
     def stop_decoding(self):
         # 1. Stop background thread
@@ -619,15 +627,6 @@ class SpectrumAnalyzerGUI(QMainWindow):
             self._updating_tuning_ui = False
 
     def update_stderr_line(self, line):
-        MODCOD_TABLE = {
-            1: "QPSK1/4", 2: "QPSK1/3", 3: "QPSK2/5", 4: "QPSK1/2", 5: "QPSK3/5",
-            6: "QPSK2/3", 7: "QPSK3/4", 8: "QPSK4/5", 9: "QPSK5/6", 10: "QPSK8/9",
-            11: "QPSK9/10", 12: "8PSK3/5", 13: "8PSK2/3", 14: "8PSK3/4", 15: "8PSK5/6",
-            16: "8PSK8/9", 17: "8PSK9/10", 18: "16APSK2/3", 19: "16APSK3/4",
-            20: "16APSK4/5", 21: "16APSK5/6", 22: "16APSK8/9", 23: "16APSK9/10",
-            24: "32APSK3/4", 25: "32APSK4/5", 26: "32APSK5/6", 27: "32APSK8/9",
-            28: "32APSK9/10",
-        }
         m = re.match(r"Spawning LDPC helper: modcod=(\d+)", line)
         if m:
             modcod_num = int(m.group(1))
@@ -635,18 +634,6 @@ class SpectrumAnalyzerGUI(QMainWindow):
         else:
             self.unknown_info_lines.append(line)
             self.error_label.setText("\n".join(self.unknown_info_lines))
-            # self.error_label.verticalScrollBar().setValue(
-            #     self.error_label.verticalScrollBar().maximum()
-            # )
-
-    '''
-    def update_stderr_line(self, line):
-        if line.startswith("Creating LUT for"):
-            self.modcod_label.setText(line[len("Creating LUT for "):])
-        else:
-            self.unknown_info_lines.append(line)
-            self.error_label.setText("\n".join(self.unknown_info_lines))
-    '''
 
     def browse_file(self):
         filepath, _ = QFileDialog.getOpenFileName(self, "Open IQ File", "")
@@ -729,8 +716,6 @@ class SpectrumAnalyzerGUI(QMainWindow):
         freqs = np.fft.fftshift(np.fft.fftfreq(self.fft_size, d=1.0/sample_rate_hz))
 
         # 6. Push data straight to the PyQtGraph curve
-        self.curve.setData(freqs, self.avg_psd)
-        
         self.curve.setData(freqs, self.avg_psd)
         self.update_snr_display()
 
