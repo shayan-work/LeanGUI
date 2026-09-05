@@ -2,8 +2,6 @@ import sys
 import os
 import json
 import re
-import select
-import time
 import subprocess
 import pyqtgraph as pg
 import numpy as np
@@ -12,6 +10,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QFileDialog, QDoubleSpinBox, QMessageBox, QComboBox, QGridLayout, QFormLayout, QGroupBox)
 from PySide6.QtCore import QTimer, QThread, Signal
 from collections import deque
+
 
 class ConstellationReader(QThread):
     # Signal to send parsed (I, Q) points back to the main GUI thread
@@ -42,9 +41,11 @@ class ConstellationReader(QThread):
                     continue
 
             if batch:
-                self.new_points_signal.emit(batch)   
+                self.new_points_signal.emit(batch)
+
     def stop(self):
         self.running = False
+
 
 class InfoReader(QThread):
     new_line_signal = Signal(str)
@@ -67,6 +68,7 @@ class InfoReader(QThread):
     def stop(self):
         self.running = False
 
+
 class StderrReader(QThread):
     new_line_signal = Signal(str)
 
@@ -86,107 +88,7 @@ class StderrReader(QThread):
 
     def stop(self):
         self.running = False
-        
-class SymbolRateSearchThread(QThread):
-    progress_signal = Signal(str)
-    found_signal = Signal(float)
-    failed_signal = Signal()
 
-    def __init__(self, iq_path, samp_rate_hz, rs_estimate_msps, trial_timeout_s=2.0):
-        super().__init__()
-        self.iq_path = iq_path
-        self.samp_rate_hz = samp_rate_hz
-        self.rs_estimate_msps = rs_estimate_msps
-        self.trial_timeout_s = trial_timeout_s
-        self.running = True
-
-    def run(self):
-        # Relative offsets around the spectral estimate, tightest first
-        deltas_pct = [0.0, 0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 5.0, -5.0]
-        for i, pct in enumerate(deltas_pct):
-            if not self.running:
-                return
-            candidate = self.rs_estimate_msps * (1.0 + pct / 100.0)
-            self.progress_signal.emit(
-                f"Trying {candidate:.3f} Msym/s ({i + 1}/{len(deltas_pct)})..."
-            )
-            if self._try_symbol_rate(candidate):
-                self.found_signal.emit(candidate)
-                return
-        self.failed_signal.emit()
-
-    def _try_symbol_rate(self, rs_msps):
-        info_r_fd, info_w_fd = os.pipe()
-
-        cmd = [
-            './leandvb', '-v', '-d', '--f32',
-            '-f', f"{int(self.samp_rate_hz)}",
-            '--sr', f"{int(rs_msps * 1e6)}",
-            '--standard', 'DVB-S2',
-            '--ldpc-helper', 'ldpc_tool',
-            '--fd-info', f"{info_w_fd}",
-        ]
-        try:
-            f = open(self.iq_path, 'rb')
-        except OSError:
-            os.close(info_r_fd)
-            os.close(info_w_fd)
-            return False
-
-        proc = subprocess.Popen(
-            cmd, stdin=f, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            pass_fds=[info_w_fd]
-        )
-        f.close()
-        os.close(info_w_fd)
-
-        current_lock = False
-        current_vber = None
-        consecutive_good = 0
-        required_consecutive = 3
-        vber_threshold = 0.01
-        locked_confirmed = False
-
-        deadline = time.time() + self.trial_timeout_s
-        info_stream = os.fdopen(info_r_fd, 'r')
-        try:
-            while time.time() < deadline and self.running:
-                remaining = deadline - time.time()
-                ready, _, _ = select.select([info_stream], [], [], max(remaining, 0))
-                if not ready:
-                    break
-                line = info_stream.readline()
-                if not line:
-                    break
-                parts = line.strip().split(maxsplit=1)
-                if not parts:
-                    continue
-                keyword = parts[0]
-                value = parts[1].strip() if len(parts) > 1 else ""
-
-                if keyword == "FRAMELOCK":
-                    current_lock = (value == "1")
-                elif keyword == "VBER":
-                    try:
-                        current_vber = float(value)
-                    except ValueError:
-                        current_vber = None
-
-                good_now = current_lock and current_vber is not None and current_vber <= vber_threshold
-                consecutive_good = consecutive_good + 1 if good_now else 0
-                if consecutive_good >= required_consecutive:
-                    locked_confirmed = True
-                    break
-        finally:
-            info_stream.close()
-            proc.terminate()
-            try:
-                proc.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-
-        return locked_confirmed
 
 class SpectrumAnalyzerGUI(QMainWindow):
     def __init__(self):
@@ -200,32 +102,31 @@ class SpectrumAnalyzerGUI(QMainWindow):
         self.file_handle = None
         self.avg_psd = None
         self.alpha = 0.3
-        
+
         # Buffer Parameters
         self.const_history_size = 1000
         self.i_buffer = deque(maxlen=self.const_history_size)
         self.q_buffer = deque(maxlen=self.const_history_size)
         self.unknown_info_lines = deque(maxlen=6)
-        
-        # References to manage our background p rocesses
+
+        # References to manage our background processes
         self.leandvb_process = None
         self.const_reader_thread = None
         self.mpv_process = None
         self.info_reader_thread = None
         self.stderr_reader_thread = None
-        self.autotune_thread = None
-        
+
         # Initialize GUI layout
         self.init_ui()
-        
+
         # Setup the QTimer for real-time plotting
         self.timer = QTimer()
         self.timer.timeout.connect(self.process_next_frame)
-        
+
         self.const_timer = QTimer()
         self.const_timer.timeout.connect(self.redraw_constellation)
         self.const_timer.start(33)  # same 30fps cadence as the spectrum plot
-        
+
         self._updating_tuning_ui = False
 
     def redraw_constellation(self):
@@ -239,14 +140,17 @@ class SpectrumAnalyzerGUI(QMainWindow):
 
         # --- Top Control Bar ---
         control_layout = QHBoxLayout()
-        
+
         # File selector
         control_layout.addWidget(QLabel("IQ File (.iq / .raw):"))
         self.file_path_input = QLineEdit()
         self.file_path_input.setPlaceholderText("Select a 32-bit float complex IQ file...")
         self.file_path_input.setText("/home/eocs/LeanGUI/DVBS2_SPS8_8PSK34_12MSPS_1_5MSymRate_noOffset_RRC")
+        self.file_path_input.editingFinished.connect(
+            lambda: self.start_plotting(self.file_path_input.text())
+        )
         control_layout.addWidget(self.file_path_input)
-        
+
         self.browse_btn = QPushButton("Browse...")
         self.browse_btn.clicked.connect(self.browse_file)
         control_layout.addWidget(self.browse_btn)
@@ -258,49 +162,36 @@ class SpectrumAnalyzerGUI(QMainWindow):
         self.samp_rate_spin.setValue(12.000)  # Default 12 MHz
         self.samp_rate_spin.setDecimals(3)
         control_layout.addWidget(self.samp_rate_spin)
-        
+
         # 1. Center/Offset Frequency Input (Text Box)
         control_layout.addWidget(QLabel("Offset (MHz):"))
         self.center_freq_edit = QLineEdit()
         self.center_freq_edit.setText("0.0")  # Set default starting text
-        self.center_freq_edit.setFixedWidth(80) # Keep layout clean and compact
+        self.center_freq_edit.setFixedWidth(80)  # Keep layout clean and compact
         control_layout.addWidget(self.center_freq_edit)
-        
+
         # 2. Symbol Rate Input (Text Box)
         control_layout.addWidget(QLabel("Symbol Rate (MSps):"))
         self.symbol_rate_edit = QLineEdit()
         self.symbol_rate_edit.setText("1.500")  # Set default starting text
         self.symbol_rate_edit.setFixedWidth(80)
         control_layout.addWidget(self.symbol_rate_edit)
-        
+
         # 3. Roll-off Factor Input (Dropdown/Combo Box)
         control_layout.addWidget(QLabel("Roll-off (α):"))
         self.rolloff_combo = QComboBox()
-        self.rolloff_combo.addItems(["0.35", "0.25", "0.20"]) 
+        self.rolloff_combo.addItems(["0.35", "0.25", "0.20"])
         self.rolloff_combo.setCurrentText("0.20")  # Default to 0.20
         control_layout.addWidget(self.rolloff_combo)
-
-        # Play/Pause Buttons
-        self.start_btn = QPushButton("Start Plotting")
-        self.start_btn.setStyleSheet("background-color: green; color: white;")
-        self.start_btn.clicked.connect(self.toggle_plotting)
-        control_layout.addWidget(self.start_btn)
 
         # Decode Button
         self.decode_btn = QPushButton("Start Decoding")
         self.decode_btn.setStyleSheet("background-color: blue; color: white;")
         self.decode_btn.clicked.connect(self.toggle_decoding)
         control_layout.addWidget(self.decode_btn)
-        
-        self.autotune_btn = QPushButton("Auto-Tune Rs")
-        self.autotune_btn.clicked.connect(self.start_autotune)
-        control_layout.addWidget(self.autotune_btn)
 
         main_layout.addLayout(control_layout)
-        
-        self.autotune_status_label = QLabel("")
-        main_layout.addWidget(self.autotune_status_label)
-        
+
         # --- Spectrum Plot ---
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setBackground('k')
@@ -332,7 +223,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
         )
         self.const_widget.addItem(self.const_scatter)
 
-         # --- Info panel (bottom-left) ---
+        # --- Info panel (bottom-left) ---
         self.info_panel = QGroupBox("Demodulator Status")
         info_layout = QFormLayout()
 
@@ -371,23 +262,21 @@ class SpectrumAnalyzerGUI(QMainWindow):
         content_grid.setColumnStretch(0, 1)
         content_grid.setColumnStretch(1, 1)
         main_layout.addLayout(content_grid)
-        
-        
+
         # Shaded region representing occupied bandwidth (BW = Rs * (1 + alpha))
         self.tuning_region = pg.LinearRegionItem(
             values=[-625000, 625000],  # Default boundaries (Hz)
-            orientation='vertical', 
-            brush=pg.mkBrush(0, 100, 255, 50), 
+            orientation='vertical',
+            brush=pg.mkBrush(0, 100, 255, 50),
             pen=pg.mkPen('r', style=pg.QtCore.Qt.DashLine)
         )
-        self.tuning_region.setMovable(False) 
         self.plot_widget.addItem(self.tuning_region)
         self.tuning_region.setMovable(True)
 
         # Dashed white line indicating exact center frequency (offset)
         self.center_line = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen('w', style=pg.QtCore.Qt.DashLine))
         self.plot_widget.addItem(self.center_line)
-        
+
         # Connect text changes and index changes to trigger redraw
         self.center_freq_edit.textChanged.connect(self.update_tuning_bars)
         self.symbol_rate_edit.textChanged.connect(self.update_tuning_bars)
@@ -395,6 +284,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
 
         # Run an initial update calculation to draw default positions on open
         self.update_tuning_bars()
+
         self._updating_tuning_ui = False
         self.tuning_region.sigRegionChanged.connect(self.on_tuning_region_dragged)
         self.tuning_region.sigRegionChangeFinished.connect(self.estimate_symbol_rate_from_spectrum)
@@ -429,7 +319,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
             fc_mhz = float(self.center_freq_edit.text().strip())
             rs_msps = float(self.symbol_rate_edit.text().strip())
             # Default sample rate from spin box (scale to Hz)
-            samp_rate_hz = self.samp_rate_spin.value() * 1e6 
+            samp_rate_hz = self.samp_rate_spin.value() * 1e6
             beta = float(self.rolloff_combo.currentText())
         except ValueError:
             QMessageBox.warning(self, "Invalid Parameters", "Please check your tuning parameters.")
@@ -450,14 +340,12 @@ class SpectrumAnalyzerGUI(QMainWindow):
             '--derotate', f"{int(fc_mhz * 1e6)}",
             '--roll-off', f"{beta}",
             '--standard', 'DVB-S2',
-            '--ldpc-helper', 'ldpc_tool', # Assumes ldpc_tool is in your system PATH
+            '--ldpc-helper', 'ldpc_tool',  # Assumes ldpc_tool is in your system PATH
             '--hq',
             '--fd-const', f"{w_fd}",    # Instruct leandvb to write symbols to our pipe write-end
             '--fd-info', f"{info_w_fd}",
             '--json'                    # Tells leandvb to format outputs as easy-to-parse JSON
         ]
-        
-        #QTimer.singleShot(2000, lambda: print("leandvb alive:", self.leandvb_process.poll() is None))
 
         try:
             # 3. Open the file to pipe into stdin
@@ -465,10 +353,6 @@ class SpectrumAnalyzerGUI(QMainWindow):
 
             # 4. Spawn leandvb process
             # pass_fds keeps the specific write-end descriptor open in the child process
-            import subprocess
-            #self.leandvb_process = subprocess.Popen(cmd, stdin=self.iq_file_stream, pass_fds=[w_fd])
-            
-            
             self.leandvb_process = subprocess.Popen(
                 cmd,
                 stdin=self.iq_file_stream,
@@ -478,7 +362,6 @@ class SpectrumAnalyzerGUI(QMainWindow):
             )
             os.close(w_fd)
             os.close(info_w_fd)
-    
 
             # 4b. Spawn mpv, embedded into video_widget via its X11 window id
             self.mpv_process = subprocess.Popen(
@@ -494,18 +377,16 @@ class SpectrumAnalyzerGUI(QMainWindow):
             # Hand the read end to mpv; without closing our copy, leandvb
             # never gets SIGPIPE/EPIPE when mpv exits or is killed.
             self.leandvb_process.stdout.close()
-            
-
 
             # 5. Start the background thread reading from the read descriptor
             self.const_reader_thread = ConstellationReader(r_fd)
             self.const_reader_thread.new_points_signal.connect(self.update_constellation_plot)
             self.const_reader_thread.start()
-            
+
             self.info_reader_thread = InfoReader(info_r_fd)
             self.info_reader_thread.new_line_signal.connect(self.update_info_line)
             self.info_reader_thread.start()
-            
+
             self.stderr_reader_thread = StderrReader(self.leandvb_process.stderr)
             self.stderr_reader_thread.new_line_signal.connect(self.update_stderr_line)
             self.stderr_reader_thread.start()
@@ -537,19 +418,17 @@ class SpectrumAnalyzerGUI(QMainWindow):
             # Unmapped keyword - surface it instead of guessing/discarding
             self.unknown_info_lines.append(line)
             self.error_label.setText("\n".join(self.unknown_info_lines))
-    
+
     def update_constellation_plot(self, points):
         #print(f"got {len(points)} points, e.g. {points[0]}")
         # Unpack the batch and append to our rolling FIFO queues
         for i, q in points:
             self.i_buffer.append(i)
             self.q_buffer.append(q)
-
         # Re-plot the rolling window
         #self.const_scatter.setData(x=list(self.i_buffer), y=list(self.q_buffer))
         #self.const_widget.enableAutoRange(axis=pg.ViewBox.XYAxes, enable=True)
 
-        
     def stop_decoding(self):
         # 1. Stop background thread
         if self.const_reader_thread:
@@ -562,7 +441,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
             self.leandvb_process.terminate()
             self.leandvb_process.wait()
             self.leandvb_process = None
-        
+
         # 3. Terminate mpv
         if self.mpv_process:
             self.mpv_process.terminate()
@@ -573,18 +452,18 @@ class SpectrumAnalyzerGUI(QMainWindow):
         if hasattr(self, 'iq_file_stream') and self.iq_file_stream:
             self.iq_file_stream.close()
             self.iq_file_stream = None
-            
+
         if self.info_reader_thread:
             self.info_reader_thread.stop()
             self.info_reader_thread.wait()
             self.info_reader_thread = None
-            
+
         self.lock_label.setText("—")
         self.ss_label.setText("—")
         self.mer_label.setText("—")
         self.ber_label.setText("—")
         self.offset_label.setText("—")
-            
+
         if self.stderr_reader_thread:
             self.stderr_reader_thread.stop()
             self.stderr_reader_thread.wait()
@@ -633,7 +512,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
             self.center_line.setValue(fc_hz)
         finally:
             self._updating_tuning_ui = False
-            
+
     def on_tuning_region_dragged(self):
         if self._updating_tuning_ui:
             return  # this change came from our own code, not a mouse drag
@@ -657,44 +536,9 @@ class SpectrumAnalyzerGUI(QMainWindow):
             fc_hz = (f_min + f_max) / 2.0
             self.center_freq_edit.setText(f"{fc_hz / 1e6:.4f}")
 
-    def start_autotune(self):
-        self.estimate_symbol_rate_from_spectrum()  # get a Stage-1 starting point first
-
-        iq_path = self.file_path_input.text()
-        if not iq_path or not os.path.exists(iq_path):
-            QMessageBox.warning(self, "Error", "Please select a valid IQ file.")
-            return
-
-        try:
-            rs_estimate = float(self.symbol_rate_edit.text().strip())
-        except ValueError:
-            QMessageBox.warning(self, "Error", "Symbol rate estimate is invalid.")
-            return
-
-        samp_rate_hz = self.samp_rate_spin.value() * 1e6
-
-        self.autotune_btn.setEnabled(False)
-        self.autotune_status_label.setText("Starting auto-tune...")
-
-        self.autotune_thread = SymbolRateSearchThread(iq_path, samp_rate_hz, rs_estimate)
-        self.autotune_thread.progress_signal.connect(self.autotune_status_label.setText)
-        self.autotune_thread.found_signal.connect(self.on_autotune_found)
-        self.autotune_thread.failed_signal.connect(self.on_autotune_failed)
-        self.autotune_thread.start()
-
-    def on_autotune_found(self, rs_msps):
-        self.symbol_rate_edit.setText(f"{rs_msps:.3f}")
-        self.autotune_status_label.setText(f"Locked at {rs_msps:.3f} Msym/s")
-        self.autotune_btn.setEnabled(True)
-
-    def on_autotune_failed(self):
-        self.autotune_status_label.setText("Auto-tune failed - no candidate locked.")
-        self.autotune_btn.setEnabled(True)
-            
     def estimate_symbol_rate_from_spectrum(self):
         if self._updating_tuning_ui:
             return
-
         iq_path = self.file_path_input.text()
         if not iq_path or not os.path.exists(iq_path):
             QMessageBox.warning(self, "Error", "Please select a valid IQ file first.")
@@ -745,8 +589,7 @@ class SpectrumAnalyzerGUI(QMainWindow):
             self.symbol_rate_edit.setText(f"{max(rs_hz / 1e6, 0.001):.3f}")
         finally:
             self._updating_tuning_ui = False
-        
-    
+
     def update_stderr_line(self, line):
         MODCOD_TABLE = {
             1: "QPSK1/4", 2: "QPSK1/3", 3: "QPSK2/5", 4: "QPSK1/2", 5: "QPSK3/5",
@@ -764,11 +607,11 @@ class SpectrumAnalyzerGUI(QMainWindow):
         else:
             self.unknown_info_lines.append(line)
             self.error_label.setText("\n".join(self.unknown_info_lines))
-  #          self.error_label.verticalScrollBar().setValue(
-   #             self.error_label.verticalScrollBar().maximum()
-    #        )
-        
-    '''    
+            # self.error_label.verticalScrollBar().setValue(
+            #     self.error_label.verticalScrollBar().maximum()
+            # )
+
+    '''
     def update_stderr_line(self, line):
         if line.startswith("Creating LUT for"):
             self.modcod_label.setText(line[len("Creating LUT for "):])
@@ -776,38 +619,33 @@ class SpectrumAnalyzerGUI(QMainWindow):
             self.unknown_info_lines.append(line)
             self.error_label.setText("\n".join(self.unknown_info_lines))
     '''
-    
+
     def browse_file(self):
         filepath, _ = QFileDialog.getOpenFileName(self, "Open IQ File", "")
         if filepath:
             self.file_path_input.setText(filepath)
+            self.start_plotting(filepath)
 
-    def toggle_plotting(self):
-        if self.timer.isActive():
-            # Stop the loop
-            self.timer.stop()
-            self.start_btn.setText("Start Plotting")
-            self.start_btn.setStyleSheet("background-color: green; color: white;")
-            if self.file_handle:
-                self.file_handle.close()
-                self.file_handle = None
-        else:
-            # Start the loop
-            self.avg_psd = None
-            filepath = self.file_path_input.text()
-            if not filepath or not os.path.exists(filepath):
-                QMessageBox.warning(self, "File Error", "Please select a valid IQ file first.")
-                return
+    def start_plotting(self, filepath):
+        if not filepath or not os.path.exists(filepath):
+            QMessageBox.warning(self, "File Error", "Please select a valid IQ file first.")
+            return
 
-            try:
-                self.file_handle = open(filepath, "rb")
-                self.start_btn.setText("Stop Plotting")
-                self.start_btn.setStyleSheet("background-color: red; color: white;")
-                
-                # Start timer (33ms interval ≈ 30 frames per second)
-                self.timer.start(33)
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to open file: {str(e)}")
+        # Stop any previous plotting session before starting a new one
+        self.stop_plotting()
+
+        self.avg_psd = None
+        try:
+            self.file_handle = open(filepath, "rb")
+            self.timer.start(33)  # ~30 frames per second
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to open file: {str(e)}")
+
+    def stop_plotting(self):
+        self.timer.stop()
+        if self.file_handle:
+            self.file_handle.close()
+            self.file_handle = None
 
     def process_next_frame(self):
         if not self.file_handle:
@@ -823,16 +661,16 @@ class SpectrumAnalyzerGUI(QMainWindow):
             self.file_handle.seek(0)
             chunk_bytes = self.file_handle.read(bytes_to_read)
             if not chunk_bytes:
-                self.toggle_plotting() # Stop if file is completely empty
+                self.stop_plotting()  # Stop if file is completely empty
                 return
 
         # Convert raw bytes to float32 NumPy array
         raw_floats = np.frombuffer(chunk_bytes, dtype=np.float32)
-        
+
         # Interleave to build complex array
         i_data = raw_floats[0::2]
         q_data = raw_floats[1::2]
-        
+
         # Safety catch if a truncated read occurred at the end of the file
         if len(i_data) < self.fft_size:
             return
@@ -844,14 +682,14 @@ class SpectrumAnalyzerGUI(QMainWindow):
 
         # 2. Perform FFT
         fft_data = np.fft.fft(windowed_iq)
-        
+
         # 3. Center DC
         fft_shifted = np.fft.fftshift(fft_data)
-        
+
         # 4. Calculate power in dB scale
         magnitude_spectrum = np.abs(fft_shifted)
         psd_db = 20 * np.log10(magnitude_spectrum + 1e-12)
-        
+
         if self.avg_psd is None:
             self.avg_psd = psd_db
         else:
@@ -866,10 +704,8 @@ class SpectrumAnalyzerGUI(QMainWindow):
         self.curve.setData(freqs, self.avg_psd)
 
     def closeEvent(self, event):
-        self.timer.stop()
-        self.stop_decoding() # Cleanup child processes & threads
-        if self.file_handle:
-            self.file_handle.close()
+        self.stop_plotting()
+        self.stop_decoding()  # Cleanup child processes & threads
         event.accept()
 
 
