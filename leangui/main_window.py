@@ -115,6 +115,9 @@ class MainWindow(QMainWindow):
         self.file_panel.file_selected.connect(self.start_plotting)
         self.control_bar.decode_toggle_requested.connect(self.toggle_decoding)
         self.control_bar.tuning_changed.connect(self.update_tuning_bars)
+        
+        self.sdr_panel.bandwidth_changed.connect(self._on_bandwidth_changed)
+        self.sdr_panel.config_committed.connect(self._start_realtime_spectrum)
 
         self.spectrum_plot.region_changed.connect(self.on_tuning_region_dragged)
         self.spectrum_plot.region_change_finished.connect(self.estimate_symbol_rate_from_spectrum)
@@ -124,12 +127,10 @@ class MainWindow(QMainWindow):
 
     # --- input source ---------------------------------------------------
     def on_source_changed(self, source):
-        # Stop anything currently running whenever the source changes.
         self.stop_plotting()
         self.stop_decoding()
+        self._stop_realtime_spectrum()
 
-        # Clear the spectrum plot / rolling average so switching sources
-        # never leaves a stale trace on screen.
         self.avg_power = None
         self.avg_psd = None
         self.spectrum_plot.update_curve([], [])
@@ -140,6 +141,7 @@ class MainWindow(QMainWindow):
         self.sdr_panel.setVisible(source == "realtime")
         if source == "realtime":
             self.sdr_panel.set_status("Idle.", "orange")
+            self._start_realtime_spectrum()
 
     # --- decode chain lifecycle ---------------------------------------
     def toggle_decoding(self):
@@ -218,19 +220,35 @@ class MainWindow(QMainWindow):
 
         self._launch_chain(IQSource(kind="file", path=iq_path, sample_format="f32"), tuning)
 
-    def _start_decoding_realtime(self):
-        self.stop_decoding()  # prevent double-running
+    def _on_bandwidth_changed(self, text):
+        if self.current_source != "realtime":
+            return
+        text = text.strip()
+        if not text:
+            return
+        try:
+            float(text)
+        except ValueError:
+            return
+        self.control_bar.set_sample_rate_mhz(text)
 
-        self.constellation_plot.clear_points()
-        self.info_panel.clear_modcod()
-        self.video_panel.set_encrypted(False)
+    def _start_realtime_spectrum(self):
+        """(Re)start the persistent SDR capture + spectrum feed. Independent
+        of decode-chain state - called whenever the SDR panel's RF params are
+        committed while Real-Time Signal (SDR) is selected."""
+        if self.current_source != "realtime":
+            return
+
+        sample_rate_hz = self.control_bar.sample_rate_hz()
+        if sample_rate_hz <= 0:
+            return  # bandwidth not entered yet, see _on_bandwidth_changed
 
         try:
-            tuning = self._build_tuning()
-            sdr_config = self.sdr_panel.build_config(tuning.sample_rate_hz)
+            sdr_config = self.sdr_panel.build_config(sample_rate_hz)
         except ValueError:
-            QMessageBox.warning(self, "Invalid Parameters", "Please check your tuning / BladeRF parameters.")
-            return
+            return  # RF freq / bandwidth / gain not fully filled in yet
+
+        self._stop_realtime_spectrum()
 
         self.avg_power = None
         self.avg_psd = None
@@ -246,14 +264,45 @@ class MainWindow(QMainWindow):
         if not sdr_source.is_running():
             return
         self.sdr_source = sdr_source
-        self.spectrum_timer.start(33)  # ~30 frames per second, see _on_realtime_chunk
+        self.spectrum_timer.start(33)
 
-        source = IQSource(kind="fifo", path=sdr_source.lean_fifo_path, sample_format=sdr_source.sample_format)
-        chain = self._launch_chain(source, tuning)
-        if chain is None or not chain.is_running():
+    def _stop_realtime_spectrum(self):
+        """Tear down the persistent capture feed, and any decode chain riding
+        on it (a chain reads from sdr_source.lean_fifo_path, so it can't
+        outlive the capture)."""
+        if self.active_chain:
+            self.active_chain.stop()
+            self.active_chain = None
+            self.control_bar.set_decoding_active(False)
+        if self.sdr_source:
             self.sdr_source.stop()
             self.sdr_source = None
-            self.spectrum_timer.stop()
+        self.spectrum_timer.stop()
+        self._latest_realtime_chunk = None
+
+    def _start_decoding_realtime(self):
+        if self.sdr_source is None or not self.sdr_source.is_running():
+            QMessageBox.warning(
+                self, "SDR Not Streaming",
+                "Enter RF Center Frequency, RX Bandwidth and Gain first - "
+                "the spectrum feed must be running before decoding can start."
+            )
+            return
+
+        self.stop_decoding()  # prevent double-running
+
+        self.constellation_plot.clear_points()
+        self.info_panel.clear_modcod()
+        self.video_panel.set_encrypted(False)
+
+        try:
+            tuning = self._build_tuning()
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Parameters", "Please check your tuning parameters.")
+            return
+
+        source = IQSource(kind="fifo", path=self.sdr_source.lean_fifo_path, sample_format=self.sdr_source.sample_format)
+        self._launch_chain(source, tuning)
 
     def _on_chain_error(self, message):
         QMessageBox.critical(self, "Process Error", message)
@@ -262,12 +311,6 @@ class MainWindow(QMainWindow):
         if self.active_chain:
             self.active_chain.stop()
             self.active_chain = None
-        if self.sdr_source:
-            self.sdr_source.stop()
-            self.sdr_source = None
-        if self.current_source == "realtime":
-            self.spectrum_timer.stop()
-            self._latest_realtime_chunk = None
         self.info_panel.reset()
         self.control_bar.set_decoding_active(False)
 
@@ -473,5 +516,6 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.stop_plotting()
-        self.stop_decoding()  # Cleanup child processes & threads
+        self.stop_decoding()
+        self._stop_realtime_spectrum()
         event.accept()

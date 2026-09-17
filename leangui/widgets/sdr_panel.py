@@ -3,9 +3,13 @@ from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox
                                 QHBoxLayout, QLabel, QLineEdit, QWidget)
 
 from ..sdr.bladerf_source import BladeRFConfig
+from PySide6.QtCore import Signal
 
 
 class SdrConfigPanel(QGroupBox):
+    bandwidth_changed = Signal(str)   # fires on every keystroke - just mirrors into sample rate
+    config_committed = Signal()       # fires when a field is "done" (Enter/focus-out) - triggers capture (re)start
+    
     def __init__(self, parent=None):
         super().__init__("Real-Time Signal Input (BladeRF)", parent)
         layout = QFormLayout()
@@ -45,6 +49,13 @@ class SdrConfigPanel(QGroupBox):
         layout.addRow("Status:", self.status_label)
 
         self.setLayout(layout)
+        
+        self.freq_edit.editingFinished.connect(self.config_committed)
+        self.bandwidth_edit.editingFinished.connect(self.config_committed)
+        self.bandwidth_edit.textChanged.connect(self.bandwidth_changed)
+        self.gain_mode_combo.currentIndexChanged.connect(lambda _i: self.config_committed.emit())
+        self.manual_gain_spin.editingFinished.connect(self.config_committed)
+
 
     def _on_gain_mode_changed(self, _index):
         mode = self.gain_mode_combo.currentData()

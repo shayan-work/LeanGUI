@@ -61,6 +61,12 @@ class ControlBar(QWidget):
         self.symbol_rate_edit.textChanged.connect(self.tuning_changed)
         self.rolloff_combo.currentIndexChanged.connect(self.tuning_changed)
 
+    def set_sample_rate_mhz(self, mhz_text):
+        try:
+            self.samp_rate_spin.setValue(float(mhz_text))
+        except ValueError:
+            pass
+
     # --- accessors ---------------------------------------------------
     def sample_rate_hz(self):
         return self.samp_rate_spin.value() * 1e6
