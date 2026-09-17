@@ -5,3 +5,24 @@ Test Signals/
 
 # Ignore the virtual environment directory and all its contents
 .venv/
+
+# Prebuilt leandvb/ldpc_tool binaries (see build.sh) - no longer git-tracked.
+# They still live at the project root as a convenience so the app keeps
+# working out of the box; use build.sh to (re)build them from source.
+/leandvb
+/ldpc_tool
+
+# build.sh scratch clone and output directory (build artifacts, not source)
+/leansdr-src/
+/build/
+/recordings/
+
+#Ignore Test Stuff
+SIGNAL_CHAIN_REPORT.md
+TECHNICAL_REPORT.md
+Test_Signals/
+leandvb_test_rec_1.log
+pytest.ini
+test.py
+test_rec_1_ts.bin
+tests/
