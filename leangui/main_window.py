@@ -16,6 +16,8 @@ from .dsp.spectrum import (
     freq_axis,
     power_to_db,
     read_iq_chunk,
+    estimate_symbol_rate_hz_from_iq,
+    IQRingBuffer,
 )
 from .sdr.bladerf_source import BladeRFSource
 from .widgets.constellation_plot import ConstellationPlotWidget
@@ -55,6 +57,7 @@ class MainWindow(QMainWindow):
         # Latest chunk handed off by the SDR fan-out thread, redrawn at a
         # fixed cadence by spectrum_timer instead of on every arrival - see
         # _on_realtime_chunk.
+        self._realtime_iq_buffer = IQRingBuffer(1 << 20)
         self._latest_realtime_chunk = None
 
         self._init_ui()
@@ -232,6 +235,7 @@ class MainWindow(QMainWindow):
         self.avg_power = None
         self.avg_psd = None
         self._latest_realtime_chunk = None
+        self._realtime_iq_buffer = IQRingBuffer(1 << 20)
 
         sdr_source = BladeRFSource(self.fft_size)
         sdr_source.spectrum_chunk.connect(self._on_realtime_chunk)
@@ -327,6 +331,7 @@ class MainWindow(QMainWindow):
         # instead used to flood the GUI thread and crash the app.
         if self.current_source != "realtime":
             return  # stale signal from a source switch or shutdown
+        self._realtime_iq_buffer.write(iq_complex)
         self._latest_realtime_chunk = iq_complex
 
     def _update_spectrum_from_iq(self, iq_complex):
@@ -432,25 +437,31 @@ class MainWindow(QMainWindow):
     def estimate_symbol_rate_from_spectrum(self):
         if self._updating_tuning_ui:
             return
-        if self.current_source != "file":
-            return  # only a recorded file can be re-read from disk to analyze
-        iq_path = self.file_panel.file_path()
-        if not iq_path or not os.path.exists(iq_path):
-            QMessageBox.warning(self, "Error", "Please select a valid IQ file first.")
-            return
 
         sample_rate_hz = self.control_bar.sample_rate_hz()
         if sample_rate_hz <= 0:
-            return  # sample rate field is blank/0 until the user fills it in
+            return
         f_min, f_max = self.spectrum_plot.get_region()
         fc_hz = (f_min + f_max) / 2.0
-        rough_bw_hz = max(f_max - f_min, 500e3)  # only used to isolate from neighbors
+        rough_bw_hz = max(f_max - f_min, 500e3)
 
         try:
-            rs_hz = estimate_symbol_rate_hz(iq_path, sample_rate_hz, fc_hz, rough_bw_hz)
+            if self.current_source == "file":
+                iq_path = self.file_panel.file_path()
+                if not iq_path or not os.path.exists(iq_path):
+                    QMessageBox.warning(self, "Error", "Please select a valid IQ file first.")
+                    return
+                rs_hz = estimate_symbol_rate_hz(iq_path, sample_rate_hz, fc_hz, rough_bw_hz)
+            elif self.current_source == "realtime":
+                rs_hz = estimate_symbol_rate_hz_from_iq(
+                    self._realtime_iq_buffer.contents(), sample_rate_hz, fc_hz, rough_bw_hz
+                )
+            else:
+                return
         except InsufficientSamplesError:
-            QMessageBox.warning(self, "Error", "Not enough samples read from file.")
+            QMessageBox.warning(self, "Error", "Not enough samples buffered yet.")
             return
+
         if rs_hz is None:
             return
 

@@ -13,6 +13,40 @@ class EmptyFileError(Exception):
 
 class InsufficientSamplesError(Exception):
     """Raised by estimate_symbol_rate_hz when the file is too short to analyze."""
+    
+class IQRingBuffer:
+    """Fixed-size circular buffer of complex64 IQ samples. Used to give
+    estimate_symbol_rate_hz_from_iq() a sliding window of recent real-time
+    samples without reallocating/copying on every incoming chunk."""
+
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self._buf = np.zeros(capacity, dtype=np.complex64)
+        self._write_pos = 0
+        self._filled = 0
+
+    def write(self, chunk):
+        n = len(chunk)
+        if n >= self.capacity:
+            self._buf[:] = chunk[-self.capacity:]
+            self._write_pos = 0
+            self._filled = self.capacity
+            return
+        end = self._write_pos + n
+        if end <= self.capacity:
+            self._buf[self._write_pos:end] = chunk
+        else:
+            first = self.capacity - self._write_pos
+            self._buf[self._write_pos:] = chunk[:first]
+            self._buf[:end - self.capacity] = chunk[first:]
+        self._write_pos = end % self.capacity
+        self._filled = min(self.capacity, self._filled + n)
+
+    def contents(self):
+        """Buffered samples in chronological order."""
+        if self._filled < self.capacity:
+            return self._buf[:self._filled].copy()
+        return np.concatenate((self._buf[self._write_pos:], self._buf[:self._write_pos]))
 
 
 def read_iq_chunk(file_handle, fft_size):
@@ -80,12 +114,18 @@ def estimate_snr_db(avg_psd, freqs, f_min, f_max):
 
 
 def estimate_symbol_rate_hz(iq_path, sample_rate_hz, fc_hz, rough_bw_hz, n_samples=1 << 20):
-    """Estimate symbol rate from the instantaneous-power spectrum ripple.
-
-    Returns None if no plausible symbol-rate peak was found in range.
-    Raises InsufficientSamplesError if the file is too short to analyze.
-    """
     raw = np.fromfile(iq_path, dtype=np.complex64, count=n_samples)
+    return _estimate_symbol_rate_from_array(raw, sample_rate_hz, fc_hz, rough_bw_hz)
+
+
+def estimate_symbol_rate_hz_from_iq(iq_complex, sample_rate_hz, fc_hz, rough_bw_hz):
+    """Same estimator as estimate_symbol_rate_hz, but on an in-memory IQ
+    array (e.g. an accumulated real-time buffer) instead of a file path."""
+    return _estimate_symbol_rate_from_array(
+        np.asarray(iq_complex, dtype=np.complex64), sample_rate_hz, fc_hz, rough_bw_hz
+    )
+
+def _estimate_symbol_rate_from_array(raw, sample_rate_hz, fc_hz, rough_bw_hz):
     if len(raw) < 4096:
         raise InsufficientSamplesError
 
