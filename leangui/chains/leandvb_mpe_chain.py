@@ -151,8 +151,9 @@ class LeanDVBMPEChain(LeanDVBChain):
             self.error.emit("TSDuck (tsp) not found on PATH — install TSDuck to use MPE extraction")
             return
 
-        _mask, _fs, label = self._current_modcod_window()
-        self.debug_line.emit(f"DVB-S2: trying MODCODs {label}...")
+        self.debug_line.emit(
+            f"DVB-S2: acquiring lock, MODCOD auto-detected from PL header (attempt {self._attempt_num})..."
+        )
         r_fd, w_fd = os.pipe()
         info_r_fd, info_w_fd = os.pipe()
         cmd = self._build_cmd(self._source, self._tuning, w_fd, info_w_fd)

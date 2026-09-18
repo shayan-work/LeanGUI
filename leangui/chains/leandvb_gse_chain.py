@@ -52,8 +52,9 @@ class LeanDVBGSEChain(LeanDVBChain):
         self._lock_confirmed = False
         self._lock_confirm_timer.stop()
         self._attempt_num += 1
-        _mask, _fs, label = self._current_modcod_window()
-        self.debug_line.emit(f"DVB-S2: trying MODCODs {label}...")
+        self.debug_line.emit(
+            f"DVB-S2: acquiring lock, MODCOD auto-detected from PL header (attempt {self._attempt_num})..."
+        )
         r_fd, w_fd = os.pipe()
         info_r_fd, info_w_fd = os.pipe()
         gse_r_fd, gse_w_fd = os.pipe()
