@@ -254,29 +254,43 @@ class _LeanWriter(QThread):
         # destroy this still-running QThread and abort the process. Poll
         # with O_NONBLOCK instead so shutdown is never stuck waiting on a
         # reader that isn't coming.
-        fd = None
-        while self.running and fd is None:
-            try:
-                fd = os.open(self.lean_fifo_path, os.O_WRONLY | os.O_NONBLOCK)
-            except OSError:
-                time.sleep(0.1)
-        if fd is None:
-            return
-        os.set_blocking(fd, True)  # restore normal blocking writes for backpressure below
+        #
+        # Outer loop: a decode chain's leandvb process is torn down and
+        # relaunched on every Stop/Start Decoding cycle (and on every
+        # lock-watchdog retry) while this SDR source itself stays alive
+        # for the whole real-time session (see main_window's decoupled
+        # spectrum/decode lifecycle) - so the reader on the other end of
+        # this FIFO disappears and reappears many times over this thread's
+        # life, not just once. Without looping back to re-open after a
+        # broken pipe, the first reader disconnecting (e.g. the very first
+        # failed lock attempt getting stopped) would permanently kill this
+        # thread - leaving nothing to ever write into the FIFO again, so
+        # every subsequent leandvb attempt hangs forever inside its own
+        # blocking open() waiting for a writer that isn't coming back.
+        while self.running:
+            fd = None
+            while self.running and fd is None:
+                try:
+                    fd = os.open(self.lean_fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+                except OSError:
+                    time.sleep(0.1)
+            if fd is None:
+                return  # self.running went False while waiting for a reader
+            os.set_blocking(fd, True)  # restore normal blocking writes for backpressure below
 
-        try:
-            with os.fdopen(fd, 'wb', buffering=0) as f:
-                while self.running:
-                    try:
-                        chunk = self.lean_queue.get(timeout=0.5)
-                    except queue.Empty:
-                        continue
-                    try:
-                        f.write(chunk)
-                    except (OSError, BrokenPipeError, ValueError):
-                        break
-        except (OSError, ValueError):
-            pass
+            try:
+                with os.fdopen(fd, 'wb', buffering=0) as f:
+                    while self.running:
+                        try:
+                            chunk = self.lean_queue.get(timeout=0.5)
+                        except queue.Empty:
+                            continue
+                        try:
+                            f.write(chunk)
+                        except (OSError, BrokenPipeError, ValueError):
+                            break  # reader went away - loop back and wait for the next one
+            except (OSError, ValueError):
+                pass
 
     def stop(self):
         self.running = False
