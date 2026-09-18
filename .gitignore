@@ -35,3 +35,15 @@ leangui/gse/__pycache__/
 leangui/sdr/__pycache__/
 leangui/widgets/__pycache__/
 scratchpad
+
+# Python bytecode - anywhere in the tree, present or future subpackages included
+__pycache__/
+*.py[cod]
+
+# leandvb attempt recordings (RECORDINGS_DIR) - created at runtime, not source
+recordings/
+
+# Editor/OS cruft
+.vscode/
+.idea/
+.DS_Store
