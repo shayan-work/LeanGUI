@@ -598,7 +598,18 @@ class LeanDVBChain(DecodeChain):
         """
         if self.leandvb_process:
             self.leandvb_process.terminate()
-            self.leandvb_process.wait()
+            try:
+                self.leandvb_process.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                # SIGTERM didn't finish the job in time (e.g. stuck on its
+                # own ldpc_tool helper) - .wait() with no timeout would
+                # block this call indefinitely, and since stop()/
+                # _teardown_process() always run on the Qt GUI thread, that
+                # would freeze the whole app, not just decoding. SIGKILL
+                # can't be caught or blocked, so this second .wait() is
+                # bounded in practice even without an explicit timeout.
+                self.leandvb_process.kill()
+                self.leandvb_process.wait()
             self.leandvb_process = None
 
         if self._iq_file_stream:
