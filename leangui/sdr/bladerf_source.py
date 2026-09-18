@@ -102,7 +102,7 @@ def _put_drop_oldest(q, item):
 def bladerf_cli_available() -> bool:
     return shutil.which("bladeRF-cli") is not None
 
-
+'''
 @dataclass
 class BladeRFConfig:
     rf_freq_hz: float
@@ -111,7 +111,20 @@ class BladeRFConfig:
     gain_mode: str          # "agc" or "manual"
     manual_gain_db: int
     device_args: str = ""   # e.g. "*:serial=..."; blank = default device
+'''
 
+@dataclass
+class BladeRFConfig:
+    rf_freq_hz: float
+    sample_rate_hz: float
+    bandwidth_hz: float
+    gain_mode: str
+    manual_gain_db: int
+    device_args: str = ""
+    loopback_tx_path: str = ""   # non-empty enables TX alongside the normal RX capture
+    loopback_tx_gain_db: int = 0
+    loopback_tx_repeat: int = 0  # 0 = repeat indefinitely
+    
 
 class _FanoutReader(QThread):
     """Reads RAW_FIFO_PATH once and fans raw byte chunks out to two bounded
@@ -325,9 +338,19 @@ class BladeRFSource(QObject):
         else:
             exec_lines.append("set agc rx off")
             exec_lines.append(f"set gain rx {int(config.manual_gain_db)}")
+        if config.loopback_tx_path:
+            exec_lines.append(f"set gain tx {int(config.loopback_tx_gain_db)}")
+            exec_lines.append(
+                f"tx config file={config.loopback_tx_path} format=bin "
+                f"repeat={int(config.loopback_tx_repeat)}"
+            )
+
         exec_lines.append(f"rx config file={RAW_FIFO_PATH} format=bin n=0")
         exec_lines.append("rx start")
+        if config.loopback_tx_path:
+            exec_lines.append("tx start")
         exec_lines.append("rx wait")
+
 
         bladerf_cmd = ["bladeRF-cli"] + bladerf_args
         for line in exec_lines:

@@ -254,6 +254,10 @@ class MainWindow(QMainWindow):
         self.avg_psd = None
         self._latest_realtime_chunk = None
         self._realtime_iq_buffer = IQRingBuffer(1 << 20)
+        
+        sdr_config = self.sdr_panel.build_config(sample_rate_hz)
+        sdr_config.loopback_tx_path = "/home/eocs/LeanGUI/Test_Signals/composite_signal_sc16q11"  # TEMP: loopback test
+        sdr_config.loopback_tx_gain_db = 51  # start low, raise gradually while watching the RX spectrum
 
         sdr_source = BladeRFSource(self.fft_size)
         sdr_source.spectrum_chunk.connect(self._on_realtime_chunk)
