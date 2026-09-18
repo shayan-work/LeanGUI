@@ -136,6 +136,11 @@ class LeanDVBChain(DecodeChain):
     # every DVB-S code rate once.
     MAX_LOCK_ATTEMPTS = len(MODCOD_WINDOWS) * 2
     ENABLE_LOCK_WATCHDOG = True
+    # Untested starting guess - the auto-detect attempt below searches the
+    # full MODCOD/frame-size space at once instead of a narrow 3-candidate
+    # window, so it plausibly needs longer than LOCK_ACQUIRE_TIMEOUT_MS to
+    # settle. Tune against your own signal.
+    AUTO_DETECT_TIMEOUT_MS = 8000
 
     def __init__(self, video_widget=None, parent=None):
         super().__init__(video_widget, parent)
@@ -158,6 +163,12 @@ class LeanDVBChain(DecodeChain):
         # MODCOD_WINDOWS, advanced on every relaunch - see
         # _current_modcod_window and _on_lock_failure.
         self._modcod_window_idx = 0
+        # DVB-S2 only: try one unrestricted attempt first, trusting leandvb
+        # to read MODCOD/frame-size directly off the PL header (that's what
+        # the PLSC field is for) - the narrow windowed sweep below only
+        # kicks in as a fallback if that doesn't produce a real, stable
+        # lock. See _on_lock_failure.
+        self._auto_detect_phase = False
         # Set by _on_encryption_status once TSRecorder samples the TS as
         # mostly CA-scrambled - suppresses (re)spawning mpv for the rest
         # of this attempt, since a player can't show anything useful for
@@ -254,13 +265,10 @@ class LeanDVBChain(DecodeChain):
             # needed.
             cmd.append('--resample')
         if self.standard == "DVB-S2":
-            mask, framesizes, _label = self._current_modcod_window()
-            cmd += [
-                '--hq',
-                '--modcods', str(mask),
-                '--framesizes', str(framesizes),
-                '--ldpc-helper', str(PROJECT_ROOT / "ldpc_tool"),
-            ]
+            cmd += ['--hq', '--ldpc-helper', str(PROJECT_ROOT / "ldpc_tool")]
+            if not self._auto_detect_phase:
+                mask, framesizes, _label = self._current_modcod_window()
+                cmd += ['--modcods', str(mask), '--framesizes', str(framesizes)]
         else:
             # Classic DVB-S has no LDPC layer; leandvb's built-in Viterbi
             # decoder would normally handle the convolutional code via
@@ -283,6 +291,7 @@ class LeanDVBChain(DecodeChain):
         self._lock_attempt = 0
         self._lock_exhausted = False
         self._modcod_window_idx = 0
+        self._auto_detect_phase = (self.standard == "DVB-S2")
         RECORDINGS_DIR.mkdir(exist_ok=True)
         self._start_attempt()
 
@@ -311,8 +320,11 @@ class LeanDVBChain(DecodeChain):
         self._encrypted_detected = False
         self._attempt_num += 1
         if self.standard == "DVB-S2":
-            _mask, _fs, label = self._current_modcod_window()
-            self.debug_line.emit(f"DVB-S2: trying MODCODs {label}...")
+            if self._auto_detect_phase:
+                self.debug_line.emit("DVB-S2: auto-detecting MODCOD/frame size from PL header...")
+            else:
+                _mask, _fs, label = self._current_modcod_window()
+                self.debug_line.emit(f"DVB-S2: trying MODCODs {label}...")
         r_fd, w_fd = os.pipe()
         info_r_fd, info_w_fd = os.pipe()
         cmd = self._build_cmd(self._source, self._tuning, w_fd, info_w_fd)
@@ -327,7 +339,8 @@ class LeanDVBChain(DecodeChain):
             return
 
         if self.ENABLE_LOCK_WATCHDOG:
-            self._attempt_deadline = time.monotonic() + self.LOCK_ACQUIRE_TIMEOUT_MS / 1000.0
+            timeout_ms = self.AUTO_DETECT_TIMEOUT_MS if self._auto_detect_phase else self.LOCK_ACQUIRE_TIMEOUT_MS
+            self._attempt_deadline = time.monotonic() + timeout_ms / 1000.0
             self._lock_acquire_timer.start(500)
 
     def _spawn_recorder(self):
@@ -517,6 +530,21 @@ class LeanDVBChain(DecodeChain):
         self._lock_stability_timer.stop()
         self._health_check_timer.stop()
         self._lock_confirmed = False
+
+        if self.standard == "DVB-S2" and self._auto_detect_phase:
+            # Direct PLS read didn't produce a real, stable lock - fall back
+            # to the brute-force window sweep. Doesn't count against
+            # MAX_LOCK_ATTEMPTS; this attempt was never part of that budget.
+            self._auto_detect_phase = False
+            self._modcod_window_idx = 0
+            self.debug_line.emit(
+                "DVB-S2: MODCOD auto-detect from PL header did not produce a stable lock; "
+                "falling back to brute-force MODCOD sweep..."
+            )
+            self.status_update.emit({"lock": False})
+            self._relaunch_attempt()
+            return
+
         self._lock_attempt += 1
 
         if self._lock_attempt <= self.MAX_LOCK_ATTEMPTS:
