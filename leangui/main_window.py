@@ -258,7 +258,7 @@ class MainWindow(QMainWindow):
         sdr_config = self.sdr_panel.build_config(sample_rate_hz)
         sdr_config.loopback_tx_path = "/home/eocs/LeanGUI/Test_Signals/composite_signal_sc16q11"  # TEMP: loopback test
         sdr_config.loopback_tx_gain_db = 51  # start low, raise gradually while watching the RX spectrum
-
+        sdr_config.loopback_tx_freq_hz = sdr_config.rf_freq_hz + 1_000_000   # e.g. 500 kHz offset
         sdr_source = BladeRFSource(self.fft_size)
         sdr_source.spectrum_chunk.connect(self._on_realtime_chunk)
         sdr_source.status_changed.connect(self.sdr_panel.set_status)

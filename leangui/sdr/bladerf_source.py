@@ -124,7 +124,7 @@ class BladeRFConfig:
     loopback_tx_path: str = ""   # non-empty enables TX alongside the normal RX capture
     loopback_tx_gain_db: int = 0
     loopback_tx_repeat: int = 0  # 0 = repeat indefinitely
-    
+    loopback_tx_freq_hz: float = 0.0   # 0 = same as RX; set to offset TX from RX
 
 class _FanoutReader(QThread):
     """Reads RAW_FIFO_PATH once and fans raw byte chunks out to two bounded
@@ -344,6 +344,14 @@ class BladeRFSource(QObject):
                 f"tx config file={config.loopback_tx_path} format=bin "
                 f"repeat={int(config.loopback_tx_repeat)}"
             )
+        if config.loopback_tx_path:
+            tx_freq_hz = config.loopback_tx_freq_hz or config.rf_freq_hz
+            exec_lines.append(f"set frequency tx {int(tx_freq_hz)}")
+            exec_lines.append(f"set gain tx {int(config.loopback_tx_gain_db)}")
+            exec_lines.append(
+                f"tx config file={config.loopback_tx_path} format=bin "
+                f"repeat={int(config.loopback_tx_repeat)}"
+            )        
 
         exec_lines.append(f"rx config file={RAW_FIFO_PATH} format=bin n=0")
         exec_lines.append("rx start")
