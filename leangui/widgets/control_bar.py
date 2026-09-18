@@ -21,11 +21,9 @@ class ControlBar(QWidget):
         self.samp_rate_spin = QDoubleSpinBox()
         self.samp_rate_spin.setRange(0.0, 1000.0)
         self.samp_rate_spin.setDecimals(3)
-        # QDoubleSpinBox always shows a number - there's no true "empty" - so
-        # show blank at the minimum instead of a real value like 12.000,
-        # forcing the user to actually type one in.
         self.samp_rate_spin.setSpecialValueText(" ")
         self.samp_rate_spin.setValue(0.0)
+        self.samp_rate_spin.setFixedWidth(80)
         layout.addWidget(self.samp_rate_spin)
 
         layout.addWidget(QLabel("Offset (MHz):"))
@@ -42,6 +40,7 @@ class ControlBar(QWidget):
         self.rolloff_combo = QComboBox()
         self.rolloff_combo.addItems(["", "0.35", "0.25", "0.20"])
         self.rolloff_combo.setCurrentIndex(0)
+        self.rolloff_combo.setFixedWidth(70)
         layout.addWidget(self.rolloff_combo)
 
         layout.addWidget(QLabel("Chain:"))
@@ -49,12 +48,15 @@ class ControlBar(QWidget):
         self.chain_combo.addItem("None", None)
         for name in chain_names:
             self.chain_combo.addItem(name, name)
+        self.chain_combo.setFixedWidth(160)   # widest entries are chain display names - adjust if any get clipped
         layout.addWidget(self.chain_combo)
 
         self.decode_btn = QPushButton("Start Decoding")
         self.decode_btn.setStyleSheet("background-color: blue; color: white;")
         self.decode_btn.clicked.connect(self.decode_toggle_requested)
         layout.addWidget(self.decode_btn)
+
+        layout.addStretch()
 
         self.samp_rate_spin.valueChanged.connect(self.tuning_changed)
         self.center_freq_edit.textChanged.connect(self.tuning_changed)
