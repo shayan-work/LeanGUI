@@ -52,11 +52,9 @@ class LeanDVBGSEChain(LeanDVBChain):
         self._lock_confirmed = False
         self._lock_confirm_timer.stop()
         self._attempt_num += 1
-        if self._auto_detect_phase:
-            self.debug_line.emit("DVB-S2: auto-detecting MODCOD/frame size from PL header...")
-        else:
-            _mask, _fs, label = self._current_modcod_window()
-            self.debug_line.emit(f"DVB-S2: trying MODCODs {label}...")
+        self.debug_line.emit(
+            f"DVB-S2: acquiring lock, MODCOD auto-detected from PL header (attempt {self._attempt_num})..."
+        )
         r_fd, w_fd = os.pipe()
         info_r_fd, info_w_fd = os.pipe()
         gse_r_fd, gse_w_fd = os.pipe()
@@ -81,8 +79,7 @@ class LeanDVBGSEChain(LeanDVBChain):
             return
 
         if self.ENABLE_LOCK_WATCHDOG:
-            timeout_ms = self.AUTO_DETECT_TIMEOUT_MS if self._auto_detect_phase else self.LOCK_ACQUIRE_TIMEOUT_MS
-            self._attempt_deadline = time.monotonic() + timeout_ms / 1000.0
+            self._attempt_deadline = time.monotonic() + self.LOCK_ACQUIRE_TIMEOUT_MS / 1000.0
             self._lock_acquire_timer.start(500)
 
     def _relaunch_attempt(self):

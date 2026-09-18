@@ -28,9 +28,10 @@ test_rec_1_ts.bin
 tests/
 
 #Ignore pycache
-leangui/__pycache__
-leangui/chains/__pycache__
-leangui/dsp/__pycache__
-leangui/gse/__pycache__
-leangui/sdr/__pycache__
-leangui/widgets/__pycache__
+leangui/__pycache__/
+leangui/chains/__pycache__/
+leangui/dsp/__pycache__/
+leangui/gse/__pycache__/
+leangui/sdr/__pycache__/
+leangui/widgets/__pycache__/
+scratchpad

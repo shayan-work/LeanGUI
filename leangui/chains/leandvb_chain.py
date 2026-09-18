@@ -55,29 +55,6 @@ def _is_integer_multiple(sample_rate_hz, symbol_rate_hz, rel_tol=1e-6):
     return abs(ratio - round(ratio)) < rel_tol * max(ratio, 1.0)
 
 
-def _build_modcod_windows(window_size=3):
-    """Group all known MODCODs into small consecutive windows.
-
-    Empirically (see LeanDVBChain docstring/comments below), handing
-    leandvb's blind DVB-S2 scanner more than a handful of candidate
-    MODCODs at once makes it fail to ever settle into a real lock - even
-    on a signal that decodes perfectly, first try, every time, once the
-    search space is narrowed to ~3 candidates including the right one.
-    Full 28-way blind scanning isn't just slow, it's unreliable. This
-    splits the full MODCOD_TABLE into small consecutive windows so the
-    chain can sweep them (see _current_modcod_window/_on_lock_failure)
-    instead of ever asking leandvb to search all of them simultaneously.
-    """
-    codes = sorted(MODCOD_TABLE)
-    return [
-        codes[i:i + window_size]
-        for i in range(0, len(codes), window_size)
-    ]
-
-
-MODCOD_WINDOWS = _build_modcod_windows()
-
-
 def _mpv_embed_target_id(video_widget):
     """The native window id mpv's --wid should embed into.
 
@@ -105,7 +82,22 @@ class LeanDVBChain(DecodeChain):
     # failed and retried from scratch up to MAX_LOCK_ATTEMPTS times.
     # LeanDVBSChain has its own bespoke code-rate sweep instead and opts
     # out via ENABLE_LOCK_WATCHDOG.
-    LOCK_ACQUIRE_TIMEOUT_MS = 4000
+    #
+    # DVB-S2 always locks with an unrestricted --modcods/--framesizes
+    # search (leandvb reads MODCOD/frame size directly off the PL header's
+    # PLSC field every frame - that's the whole point of PLS) - confirmed
+    # directly against a real signal via a manual leandvb invocation with
+    # no --modcods/--framesizes at all. There is no narrowed-window sweep
+    # here any more (an earlier version of this chain tried restricting
+    # --modcods to small candidate windows on the theory that leandvb's
+    # blind scanner needed help; that theory doesn't hold up against a
+    # real signal locking fine fully unrestricted, and narrowing the
+    # window is exactly what caused the false-lock failure mode - see
+    # _on_lock_stable/_check_process_health). This timeout only needs to
+    # cover how long an unrestricted, single search takes to settle - if
+    # real signals need longer than this to lock, raise it; there's no
+    # narrow-window search this was ever protecting against being slow.
+    LOCK_ACQUIRE_TIMEOUT_MS = 10000
     # leandvb's FRAMELOCK line flickers 0/1 while it's still probing
     # MODCODs/timing on a real, imperfect signal - a momentary "1" is not
     # the same as an actually-usable lock. Require FRAMELOCK to hold
@@ -125,22 +117,13 @@ class LeanDVBChain(DecodeChain):
     # Only forgive prior failures once a lock has held continuously for
     # this much longer - see _on_lock_stable.
     LOCK_STABLE_MS = 6000
-    # One attempt per MODCOD window (see _current_modcod_window), two full
-    # passes - normal frames first, then short frames (empirically, mixing
-    # both frame sizes into one window's --framesizes bitmask reproduces
-    # the same never-locks failure as too many MODCODs at once - see
-    # _build_modcod_windows - so frame size gets its own sweep dimension
-    # instead of just being left wide open within a window). Covers every
-    # standard MODCOD/frame-size combination once before falling back to
-    # best-effort, same spirit as LeanDVBSChain's code-rate sweep covering
-    # every DVB-S code rate once.
-    MAX_LOCK_ATTEMPTS = len(MODCOD_WINDOWS) * 2
+    # There's no candidate set to sweep through any more (see
+    # LOCK_ACQUIRE_TIMEOUT_MS above) - every attempt runs the identical
+    # unrestricted command, so retries only exist to absorb transient
+    # glitches and leandvb's known crash-on-loss-of-lock bug, not to try
+    # different MODCOD candidates. Kept modest for that reason.
+    MAX_LOCK_ATTEMPTS = 5
     ENABLE_LOCK_WATCHDOG = True
-    # Untested starting guess - the auto-detect attempt below searches the
-    # full MODCOD/frame-size space at once instead of a narrow 3-candidate
-    # window, so it plausibly needs longer than LOCK_ACQUIRE_TIMEOUT_MS to
-    # settle. Tune against your own signal.
-    AUTO_DETECT_TIMEOUT_MS = 8000
 
     def __init__(self, video_widget=None, parent=None):
         super().__init__(video_widget, parent)
@@ -159,16 +142,6 @@ class LeanDVBChain(DecodeChain):
         self._lock_confirmed = False
         self._attempt_num = 0
         self._recording_path = None
-        # Index into (pass 0: normal frames, pass 1: short frames) x
-        # MODCOD_WINDOWS, advanced on every relaunch - see
-        # _current_modcod_window and _on_lock_failure.
-        self._modcod_window_idx = 0
-        # DVB-S2 only: try one unrestricted attempt first, trusting leandvb
-        # to read MODCOD/frame-size directly off the PL header (that's what
-        # the PLSC field is for) - the narrow windowed sweep below only
-        # kicks in as a fallback if that doesn't produce a real, stable
-        # lock. See _on_lock_failure.
-        self._auto_detect_phase = False
         # Set by _on_encryption_status once TSRecorder samples the TS as
         # mostly CA-scrambled - suppresses (re)spawning mpv for the rest
         # of this attempt, since a player can't show anything useful for
@@ -203,24 +176,6 @@ class LeanDVBChain(DecodeChain):
 
     def is_running(self):
         return self.leandvb_process is not None
-
-    def _current_modcod_window(self):
-        """(bitmask, framesizes_bitmask, label) for self._modcod_window_idx.
-
-        framesizes is leandvb's own bitmask (1=normal, 2=short); pass 0
-        sweeps every MODCOD window with normal frames, pass 1 repeats the
-        same sweep with short frames, so a real signal on either frame
-        size gets found within one full MAX_LOCK_ATTEMPTS cycle without
-        ever asking leandvb to search both at once (see
-        _build_modcod_windows for why that combination is unreliable).
-        """
-        pass_num, window_idx = divmod(self._modcod_window_idx, len(MODCOD_WINDOWS))
-        window = MODCOD_WINDOWS[window_idx % len(MODCOD_WINDOWS)]
-        mask = sum(1 << m for m in window)
-        framesizes = 1 if pass_num % 2 == 0 else 2
-        frame_label = "normal" if framesizes == 1 else "short"
-        codes = ",".join(MODCOD_TABLE[m] for m in window)
-        return mask, framesizes, f"{codes} ({frame_label} frames)"
 
     def _build_cmd(self, source, tuning, w_fd, info_w_fd):
         sample_format_flag = '--f32' if source.sample_format == 'f32' else '--s16'
@@ -265,10 +220,12 @@ class LeanDVBChain(DecodeChain):
             # needed.
             cmd.append('--resample')
         if self.standard == "DVB-S2":
+            # No --modcods/--framesizes - leave the search fully
+            # unrestricted so leandvb reads MODCOD/frame size straight off
+            # the PL header (PLSC field) every frame, same as the manual
+            # invocation this was verified against. See LOCK_ACQUIRE_TIMEOUT_MS
+            # above for why there's no narrowed-window sweep here.
             cmd += ['--hq', '--ldpc-helper', str(PROJECT_ROOT / "ldpc_tool")]
-            if not self._auto_detect_phase:
-                mask, framesizes, _label = self._current_modcod_window()
-                cmd += ['--modcods', str(mask), '--framesizes', str(framesizes)]
         else:
             # Classic DVB-S has no LDPC layer; leandvb's built-in Viterbi
             # decoder would normally handle the convolutional code via
@@ -290,8 +247,6 @@ class LeanDVBChain(DecodeChain):
         self._tuning = tuning
         self._lock_attempt = 0
         self._lock_exhausted = False
-        self._modcod_window_idx = 0
-        self._auto_detect_phase = (self.standard == "DVB-S2")
         RECORDINGS_DIR.mkdir(exist_ok=True)
         self._start_attempt()
 
@@ -320,11 +275,9 @@ class LeanDVBChain(DecodeChain):
         self._encrypted_detected = False
         self._attempt_num += 1
         if self.standard == "DVB-S2":
-            if self._auto_detect_phase:
-                self.debug_line.emit("DVB-S2: auto-detecting MODCOD/frame size from PL header...")
-            else:
-                _mask, _fs, label = self._current_modcod_window()
-                self.debug_line.emit(f"DVB-S2: trying MODCODs {label}...")
+            self.debug_line.emit(
+                f"DVB-S2: acquiring lock, MODCOD auto-detected from PL header (attempt {self._attempt_num})..."
+            )
         r_fd, w_fd = os.pipe()
         info_r_fd, info_w_fd = os.pipe()
         cmd = self._build_cmd(self._source, self._tuning, w_fd, info_w_fd)
@@ -339,8 +292,7 @@ class LeanDVBChain(DecodeChain):
             return
 
         if self.ENABLE_LOCK_WATCHDOG:
-            timeout_ms = self.AUTO_DETECT_TIMEOUT_MS if self._auto_detect_phase else self.LOCK_ACQUIRE_TIMEOUT_MS
-            self._attempt_deadline = time.monotonic() + timeout_ms / 1000.0
+            self._attempt_deadline = time.monotonic() + self.LOCK_ACQUIRE_TIMEOUT_MS / 1000.0
             self._lock_acquire_timer.start(500)
 
     def _spawn_recorder(self):
@@ -405,20 +357,19 @@ class LeanDVBChain(DecodeChain):
         #
         # But a continuously-held FRAMELOCK still isn't proof of a correct
         # decode by itself - see _check_process_health's false-lock branch
-        # for the general explanation (PL sync doesn't depend on MODCOD, so
-        # a narrow --modcods window can coincidentally validate a wrong
-        # candidate). That check only runs once leandvb has *exited*, which
-        # catches a short recorded-file attempt quickly but never fires at
-        # all for a live/fifo source (which never EOFs) or a long file that
-        # just keeps running - both would otherwise report a permanently
-        # "stable" lock while producing zero real TS output forever, with
-        # nothing left to ever advance the sweep to the actually-correct
-        # window. Apply the same real-output check here as the other,
+        # for the general explanation (leandvb's SOF correlator can sync to
+        # the physical layer without the PLHEADER's MODCOD field having
+        # decoded correctly). That check only runs once leandvb has
+        # *exited*, which catches a short recorded-file attempt quickly but
+        # never fires at all for a live/fifo source (which never EOFs) or a
+        # long file that just keeps running - both would otherwise report a
+        # permanently "stable" lock while producing zero real TS output
+        # forever. Apply the same real-output check here as the other,
         # ordinarily-sufficient safety net for exactly that gap.
         if not self._produced_real_ts_output():
             self.debug_line.emit(
                 "leandvb held FRAMELOCK continuously but produced no real TS output - "
-                "false lock on the wrong MODCOD, not a successful decode; continuing the sweep."
+                "false lock, not a successful decode; retrying."
             )
             self._on_lock_failure()
             return
@@ -489,27 +440,18 @@ class LeanDVBChain(DecodeChain):
                 return
             # FRAMELOCK held continuously (a "confirmed" lock per
             # LOCK_CONFIRM_MS) but essentially no TS bytes ever came out -
-            # a false lock, not a real one. This is a real, observed
-            # failure mode of narrowing --modcods to a small sweep window
-            # (see MODCOD_WINDOWS/_build_modcod_windows): leandvb's SOF
-            # correlator finds a genuine physical-layer sync (that part
-            # doesn't depend on MODCOD at all), but the PLHEADER's
-            # MODCOD field decodes to a value outside this window's true
-            # signal - with only ~3 candidates to check against instead
-            # of the full 28, a wrong/noisy header is more likely to
-            # coincidentally validate as one of them than it would
-            # against the full table. Treating this as "done, success"
-            # would silently strand the sweep on the wrong window
-            # forever instead of moving on to the one the real signal is
-            # actually in - so fall through to the same relaunch/sweep-
-            # advance path a genuine lock failure takes.
+            # a false lock, not a real one: leandvb's SOF correlator found
+            # a genuine physical-layer sync (that part doesn't depend on
+            # MODCOD at all), but the PLHEADER's MODCOD field never
+            # actually decoded to something leandvb could demod - so
+            # nothing to do but retry.
             self.debug_line.emit(
-                "leandvb held FRAMELOCK but produced no real TS output - false lock on the "
-                "wrong MODCOD, not a successful decode; continuing the sweep."
+                "leandvb held FRAMELOCK but produced no real TS output - false lock, "
+                "not a successful decode; retrying."
             )
-        # Exited unexpectedly (crash, or never even confirmed a lock), or
-        # a false lock per above - e.g. the known upstream crash-on-loss-
-        # of-lock bug, or a MODCOD-window false positive.
+        # Exited unexpectedly (crash, or never even confirmed a lock), or a
+        # false lock per above - e.g. the known upstream crash-on-loss-of-
+        # lock bug.
         self._on_lock_failure()
 
     def _produced_real_ts_output(self):
@@ -530,40 +472,16 @@ class LeanDVBChain(DecodeChain):
         self._lock_stability_timer.stop()
         self._health_check_timer.stop()
         self._lock_confirmed = False
-
-        if self.standard == "DVB-S2" and self._auto_detect_phase:
-            # Direct PLS read didn't produce a real, stable lock - fall back
-            # to the brute-force window sweep. Doesn't count against
-            # MAX_LOCK_ATTEMPTS; this attempt was never part of that budget.
-            self._auto_detect_phase = False
-            self._modcod_window_idx = 0
-            self.debug_line.emit(
-                "DVB-S2: MODCOD auto-detect from PL header did not produce a stable lock; "
-                "falling back to brute-force MODCOD sweep..."
-            )
-            self.status_update.emit({"lock": False})
-            self._relaunch_attempt()
-            return
-
         self._lock_attempt += 1
 
         if self._lock_attempt <= self.MAX_LOCK_ATTEMPTS:
-            if self.standard == "DVB-S2":
-                # Move to the next MODCOD window before rebuilding the
-                # command (see _current_modcod_window) - each attempt
-                # tries a different, narrow candidate set instead of
-                # blindly repeating the exact same (unreliable, see
-                # _build_modcod_windows) search.
-                self._modcod_window_idx += 1
-                _mask, _fs, label = self._current_modcod_window()
-                self.debug_line.emit(
-                    f"Reacquiring carrier lock (attempt {self._lock_attempt}/{self.MAX_LOCK_ATTEMPTS}, "
-                    f"trying MODCODs {label})..."
-                )
-            else:
-                self.debug_line.emit(
-                    f"Reacquiring carrier lock (attempt {self._lock_attempt}/{self.MAX_LOCK_ATTEMPTS})..."
-                )
+            # Same unrestricted command every time for DVB-S2 - there's no
+            # different candidate set to move to (see LOCK_ACQUIRE_TIMEOUT_MS
+            # above), just retrying past a transient glitch or leandvb's
+            # known crash-on-loss-of-lock bug.
+            self.debug_line.emit(
+                f"Reacquiring carrier lock (attempt {self._lock_attempt}/{self.MAX_LOCK_ATTEMPTS})..."
+            )
             self.status_update.emit({"lock": False})
             self._relaunch_attempt()
         elif not self._lock_exhausted:
