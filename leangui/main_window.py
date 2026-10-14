@@ -28,6 +28,8 @@ from .widgets.info_panel import DemodStatusPanel
 from .widgets.sdr_panel import SdrConfigPanel
 from .widgets.source_selector import SourceSelector
 from .widgets.spectrum_plot import SpectrumPlotWidget
+from .widgets.udp_panel import UdpOutputPanel
+from .udp_out import MODE_OFF, UdpOutputConfig
 from .widgets.video_panel import VideoPanelWidget
 
 DEFAULT_IQ_FILE = ""
@@ -53,6 +55,9 @@ class MainWindow(QMainWindow):
         # Active decode chain / SDR source (None when stopped)
         self.active_chain = None
         self.sdr_source = None
+        # True while the user has explicitly released the bladeRF; blocks
+        # every automatic capture (re)start until they click Reacquire.
+        self._sdr_released = False
         self._updating_tuning_ui = False
         # Latest chunk handed off by the SDR fan-out thread, redrawn at a
         # fixed cadence by spectrum_timer instead of on every arrival - see
@@ -82,6 +87,9 @@ class MainWindow(QMainWindow):
 
         self.control_bar = ControlBar(available_chains())
         main_layout.addWidget(self.control_bar)
+
+        self.udp_panel = UdpOutputPanel()
+        main_layout.addWidget(self.udp_panel)
 
         self.spectrum_plot = SpectrumPlotWidget()
         self.constellation_plot = ConstellationPlotWidget()
@@ -118,6 +126,7 @@ class MainWindow(QMainWindow):
         
         self.sdr_panel.bandwidth_changed.connect(self._on_bandwidth_changed)
         self.sdr_panel.config_committed.connect(self._start_realtime_spectrum)
+        self.sdr_panel.release_requested.connect(self._on_release_requested)
 
         self.spectrum_plot.region_changed.connect(self.on_tuning_region_dragged)
         self.spectrum_plot.region_change_finished.connect(self.estimate_symbol_rate_from_spectrum)
@@ -137,6 +146,8 @@ class MainWindow(QMainWindow):
         self.spectrum_plot.set_snr_text("SNR: -- dB")
 
         self.current_source = source
+        self._sdr_released = False
+        self.sdr_panel.set_released(False)
         self.file_panel.setVisible(source == "file")
         self.sdr_panel.setVisible(source == "realtime")
         if source == "realtime":
@@ -176,6 +187,18 @@ class MainWindow(QMainWindow):
         chain.debug_line.connect(self.info_panel.append_debug)
         chain.error.connect(self._on_chain_error)
         chain.encryption_detected.connect(self.video_panel.set_encrypted)
+
+        try:
+            udp_cfg = self.udp_panel.config()
+        except ValueError:
+            if self.udp_panel.mode() != MODE_OFF:
+                QMessageBox.warning(self, "Invalid UDP address", "Use host:port, e.g. 127.0.0.1:5000")
+                return None
+            udp_cfg = UdpOutputConfig()  # UDP off: a blank/odd address doesn't matter
+        if hasattr(chain, "udp_config"):
+            chain.udp_config = udp_cfg
+        elif udp_cfg is not None and udp_cfg.mode != MODE_OFF:
+            self.info_panel.append_debug("UDP output is only available in the GSE/IP data chain.")
 
         self.gse_text_panel.clear()
         self.gse_text_panel.setVisible(False)
@@ -236,7 +259,7 @@ class MainWindow(QMainWindow):
         """(Re)start the persistent SDR capture + spectrum feed. Independent
         of decode-chain state - called whenever the SDR panel's RF params are
         committed while Real-Time Signal (SDR) is selected."""
-        if self.current_source != "realtime":
+        if self.current_source != "realtime" or self._sdr_released:
             return
 
         sample_rate_hz = self.control_bar.sample_rate_hz()
@@ -269,6 +292,20 @@ class MainWindow(QMainWindow):
             return
         self.sdr_source = sdr_source
         self.spectrum_timer.start(33)
+
+    def _on_release_requested(self):
+        """Release/Reacquire button: terminating bladeRF-cli (BladeRFSource.stop)
+        is what frees the USB device for another program."""
+        if self._sdr_released:
+            self._sdr_released = False
+            self.sdr_panel.set_released(False)
+            self._start_realtime_spectrum()
+            return
+        self._sdr_released = True
+        self._stop_realtime_spectrum()  # also stops any decode chain riding on it
+        self.spectrum_plot.update_curve([], [])
+        self.sdr_panel.set_released(True)
+        self.sdr_panel.set_status("Released - bladeRF is free for other programs.", "orange")
 
     def _stop_realtime_spectrum(self):
         """Tear down the persistent capture feed, and any decode chain riding

@@ -1,6 +1,6 @@
 """BladeRF configuration panel, shown when Input Source = Real-Time Signal (SDR)."""
 from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox,
-                                QHBoxLayout, QLabel, QLineEdit, QWidget)
+                                QHBoxLayout, QLabel, QLineEdit, QPushButton, QWidget)
 
 from ..sdr.bladerf_source import BladeRFConfig
 from PySide6.QtCore import Signal
@@ -8,6 +8,7 @@ from PySide6.QtCore import Signal
 
 class SdrConfigPanel(QGroupBox):
     bandwidth_changed = Signal(str)   # fires on every keystroke - just mirrors into sample rate
+    release_requested = Signal()      # Release/Reacquire button clicked
     config_committed = Signal()       # fires when a field is "done" (Enter/focus-out) - triggers capture (re)start
     
     def __init__(self, parent=None):
@@ -48,6 +49,10 @@ class SdrConfigPanel(QGroupBox):
         self.status_label.setStyleSheet("color: orange;")
         layout.addRow("Status:", self.status_label)
 
+        self.release_btn = QPushButton("Release bladeRF")
+        self.release_btn.clicked.connect(self.release_requested)
+        layout.addRow("", self.release_btn)
+
         self.setLayout(layout)
         
         self.freq_edit.editingFinished.connect(self.config_committed)
@@ -60,6 +65,9 @@ class SdrConfigPanel(QGroupBox):
     def _on_gain_mode_changed(self, _index):
         mode = self.gain_mode_combo.currentData()
         self.manual_gain_spin.setEnabled(mode == "manual")
+
+    def set_released(self, released):
+        self.release_btn.setText("Reacquire bladeRF" if released else "Release bladeRF")
 
     def set_status(self, text, color):
         self.status_label.setText(text)

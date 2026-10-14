@@ -11,6 +11,7 @@ from PySide6.QtCore import QThread, Signal
 
 from . import decap as gd
 from .flows import classify_frame, flow_key_str, sniff_content, strip_rtp_if_present
+from ..udp_out import GseItemSplitter
 
 READ_CHUNK = 65536
 
@@ -54,16 +55,17 @@ class GSEReader(QThread):
     #: as DecodeChain.debug_line).
     debug_line = Signal(str)
 
-    def __init__(self, read_fd, parent=None):
+    def __init__(self, read_fd, parent=None, udp_sink=None):
         super().__init__(parent)
         self.read_fd = read_fd
+        self.udp_sink = udp_sink  # optional: gets each raw GSE item as one datagram
         self.running = True
 
     def stop(self):
         self.running = False
 
     def run(self):
-        buf = bytearray()
+        splitter = GseItemSplitter()
         frag_table = {}
         stats = defaultdict(int)
         flows = {}  # flow_key -> {"count", "bytes", "sniffed", "kind", "chunks"}
@@ -76,15 +78,14 @@ class GSEReader(QThread):
                     break
                 if not chunk:
                     break  # leandvb exited / pipe closed
-                buf += chunk
 
                 out_frames = []
-                while True:
-                    br = gd.BitReader(bytes(buf))
-                    ok = gd.decap_one_item(br, frag_table, out_frames, stats)
-                    if not ok:
-                        break
-                    del buf[:br.pos // 8]
+                # Whole items only; zero padding is skipped (decap_one_item
+                # alone never consumed it, so the old loop stalled there).
+                for item in splitter.feed(chunk):
+                    if self.udp_sink is not None:
+                        self.udp_sink.send(item)
+                    gd.decap_one_item(gd.BitReader(item), frag_table, out_frames, stats)
 
                 for frame in out_frames:
                     self._handle_frame(frame, flows)

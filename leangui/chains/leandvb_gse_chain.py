@@ -21,6 +21,7 @@ from PySide6.QtCore import Signal
 from .leandvb_chain import LeanDVBChain, _mpv_embed_target_id
 from .registry import register_chain
 from ..gse.reader import GSEReader
+from ..udp_out import MODE_BBF, MODE_GSE, MODE_OFF, BbframeUdpThread, UdpOutputConfig, UdpSink
 
 
 @register_chain
@@ -37,10 +38,18 @@ class LeanDVBGSEChain(LeanDVBChain):
     def __init__(self, video_widget=None, parent=None):
         super().__init__(video_widget, parent)
         self.gse_reader_thread = None
+        #: set by the GUI before start(); see udp_out.UdpOutputConfig
+        self.udp_config = UdpOutputConfig()
+        self._udp_sink = None
+        self.bbf_udp_thread = None
 
-    def _build_cmd(self, source, tuning, w_fd, info_w_fd, gse_w_fd):
+    def _build_cmd(self, source, tuning, w_fd, info_w_fd, gse_w_fd, bbf_w_fd=None):
         cmd = super()._build_cmd(source, tuning, w_fd, info_w_fd)
         cmd += ['--fd-gse', f"{gse_w_fd}"]
+        if bbf_w_fd is not None:
+            cmd += ['--fd-bbf', f"{bbf_w_fd}"]
+            if self.udp_config.bbf_l3sync:
+                cmd.append('--bbf-l3sync')
         return cmd
 
     def _start_attempt(self):
@@ -58,7 +67,13 @@ class LeanDVBGSEChain(LeanDVBChain):
         r_fd, w_fd = os.pipe()
         info_r_fd, info_w_fd = os.pipe()
         gse_r_fd, gse_w_fd = os.pipe()
-        cmd = self._build_cmd(self._source, self._tuning, w_fd, info_w_fd, gse_w_fd)
+        bbf_r_fd = bbf_w_fd = None
+        if self.udp_config.mode != MODE_OFF:
+            if self._udp_sink is None:
+                self._udp_sink = UdpSink(self.udp_config.host, self.udp_config.port)
+            if self.udp_config.mode == MODE_BBF:
+                bbf_r_fd, bbf_w_fd = os.pipe()
+        cmd = self._build_cmd(self._source, self._tuning, w_fd, info_w_fd, gse_w_fd, bbf_w_fd)
 
         try:
             # No TS ever reaches leandvb's stdout in GSE mode (it's DEVNULL
@@ -70,9 +85,13 @@ class LeanDVBGSEChain(LeanDVBChain):
             # place - there's no "show whatever leandvb produces" case to
             # guard against here the way there is for the base chain.
             self._spawn_leandvb(self._source, cmd, w_fd, info_w_fd,
-                                 extra_pass_fds=[gse_w_fd], stdout=subprocess.DEVNULL)
+                                 extra_pass_fds=[gse_w_fd] + ([bbf_w_fd] if bbf_w_fd is not None else []),
+                                 stdout=subprocess.DEVNULL)
             self._spawn_readers(r_fd, info_r_fd)
             self._spawn_gse_reader(gse_r_fd)
+            if bbf_r_fd is not None:
+                self.bbf_udp_thread = BbframeUdpThread(bbf_r_fd, self._udp_sink, self.udp_config.bbf_l3sync)
+                self.bbf_udp_thread.start()
         except Exception as e:
             self.error.emit(f"Failed to start leandvb:\n{str(e)}")
             self.stop()
@@ -110,7 +129,8 @@ class LeanDVBGSEChain(LeanDVBChain):
         self._lock_stability_timer.start(self.LOCK_STABLE_MS)
 
     def _spawn_gse_reader(self, gse_r_fd):
-        self.gse_reader_thread = GSEReader(gse_r_fd)
+        sink = self._udp_sink if self.udp_config.mode == MODE_GSE else None
+        self.gse_reader_thread = GSEReader(gse_r_fd, udp_sink=sink)
         self.gse_reader_thread.flow_update.connect(self.gse_flow_update)
         self.gse_reader_thread.text_chunk.connect(self.gse_text_chunk)
         self.gse_reader_thread.video_chunk.connect(self._on_video_chunk)
@@ -150,3 +170,15 @@ class LeanDVBGSEChain(LeanDVBChain):
             self.gse_reader_thread.stop()
             self.gse_reader_thread.wait()
             self.gse_reader_thread = None
+        if self.bbf_udp_thread:
+            self.bbf_udp_thread.stop()
+            self.bbf_udp_thread.wait()
+            self.bbf_udp_thread = None
+
+    def stop(self):
+        super().stop()
+        # Closed only on a real stop, not on a lock-watchdog relaunch, so
+        # the socket survives _teardown_process() -> _start_attempt().
+        if self._udp_sink is not None:
+            self._udp_sink.close()
+            self._udp_sink = None
