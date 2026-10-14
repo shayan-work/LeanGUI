@@ -21,7 +21,7 @@ from PySide6.QtCore import Signal
 from .leandvb_chain import LeanDVBChain, _mpv_embed_target_id
 from .registry import register_chain
 from ..gse.reader import GSEReader
-from ..udp_out import MODE_BBF, MODE_GSE, MODE_OFF, BbframeUdpThread, UdpOutputConfig, UdpSink
+from ..udp_out import MODE_BBF, MODE_GSE, MODE_PCAP, BbframeUdpThread, PcapWriter, UdpOutputConfig, UdpSink
 
 
 @register_chain
@@ -41,6 +41,7 @@ class LeanDVBGSEChain(LeanDVBChain):
         #: set by the GUI before start(); see udp_out.UdpOutputConfig
         self.udp_config = UdpOutputConfig()
         self._udp_sink = None
+        self._pcap = None
         self.bbf_udp_thread = None
 
     def _build_cmd(self, source, tuning, w_fd, info_w_fd, gse_w_fd, bbf_w_fd=None):
@@ -64,11 +65,18 @@ class LeanDVBGSEChain(LeanDVBChain):
         self.debug_line.emit(
             f"DVB-S2: acquiring lock, MODCOD auto-detected from PL header (attempt {self._attempt_num})..."
         )
+        if self.udp_config.mode == MODE_PCAP and self._pcap is None:
+            try:
+                self._pcap = PcapWriter(self.udp_config.pcap_path)
+            except OSError as e:
+                self.error.emit(f"Cannot open PCAP file:\n{e}")
+                self.stop()
+                return
         r_fd, w_fd = os.pipe()
         info_r_fd, info_w_fd = os.pipe()
         gse_r_fd, gse_w_fd = os.pipe()
         bbf_r_fd = bbf_w_fd = None
-        if self.udp_config.mode != MODE_OFF:
+        if self.udp_config.mode in (MODE_GSE, MODE_BBF):
             if self._udp_sink is None:
                 self._udp_sink = UdpSink(self.udp_config.host, self.udp_config.port)
             if self.udp_config.mode == MODE_BBF:
@@ -130,7 +138,7 @@ class LeanDVBGSEChain(LeanDVBChain):
 
     def _spawn_gse_reader(self, gse_r_fd):
         sink = self._udp_sink if self.udp_config.mode == MODE_GSE else None
-        self.gse_reader_thread = GSEReader(gse_r_fd, udp_sink=sink)
+        self.gse_reader_thread = GSEReader(gse_r_fd, udp_sink=sink, pcap_writer=self._pcap)
         self.gse_reader_thread.flow_update.connect(self.gse_flow_update)
         self.gse_reader_thread.text_chunk.connect(self.gse_text_chunk)
         self.gse_reader_thread.video_chunk.connect(self._on_video_chunk)
@@ -182,3 +190,6 @@ class LeanDVBGSEChain(LeanDVBChain):
         if self._udp_sink is not None:
             self._udp_sink.close()
             self._udp_sink = None
+        if self._pcap is not None:
+            self._pcap.close()
+            self._pcap = None

@@ -192,7 +192,7 @@ class MainWindow(QMainWindow):
             udp_cfg = self.udp_panel.config()
         except ValueError:
             if self.udp_panel.mode() != MODE_OFF:
-                QMessageBox.warning(self, "Invalid UDP address", "Use host:port, e.g. 127.0.0.1:5000")
+                QMessageBox.warning(self, "Invalid output setting", "UDP needs host:port (e.g. 127.0.0.1:5000); PCAP needs a file path.")
                 return None
             udp_cfg = UdpOutputConfig()  # UDP off: a blank/odd address doesn't matter
         if hasattr(chain, "udp_config"):

@@ -55,10 +55,11 @@ class GSEReader(QThread):
     #: as DecodeChain.debug_line).
     debug_line = Signal(str)
 
-    def __init__(self, read_fd, parent=None, udp_sink=None):
+    def __init__(self, read_fd, parent=None, udp_sink=None, pcap_writer=None):
         super().__init__(parent)
         self.read_fd = read_fd
         self.udp_sink = udp_sink  # optional: gets each raw GSE item as one datagram
+        self.pcap_writer = pcap_writer  # optional: gets each reassembled Ethernet frame
         self.running = True
 
     def stop(self):
@@ -87,6 +88,9 @@ class GSEReader(QThread):
                         self.udp_sink.send(item)
                     gd.decap_one_item(gd.BitReader(item), frag_table, out_frames, stats)
 
+                if self.pcap_writer is not None:
+                    for frame in out_frames:
+                        self.pcap_writer.write(frame)
                 for frame in out_frames:
                     self._handle_frame(frame, flows)
                 if out_frames:

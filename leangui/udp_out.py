@@ -13,6 +13,8 @@ One GSE item / one BBFRAME is sent per UDP datagram.
 """
 import os
 import socket
+import struct
+import time
 from dataclasses import dataclass
 
 from PySide6.QtCore import QThread
@@ -20,6 +22,7 @@ from PySide6.QtCore import QThread
 MODE_OFF = "off"
 MODE_GSE = "gse"
 MODE_BBF = "bbframe"
+MODE_PCAP = "pcap"  # reassembled GSE traffic as Ethernet frames, for Wireshark
 
 BBH_LEN = 10
 KBCH_MAX_BITS = 58192  # leandvb's own upper bound on dfl (fec_info::KBCH_MAX)
@@ -31,6 +34,26 @@ class UdpOutputConfig:
     host: str = "127.0.0.1"
     port: int = 5000
     bbf_l3sync: bool = False
+    pcap_path: str = ""
+
+
+class PcapWriter:
+    """Classic pcap, LINKTYPE_ETHERNET. Flushed per frame so Wireshark can
+    open the file while it is still being written."""
+
+    def __init__(self, path):
+        self._f = open(path, "wb")
+        self._f.write(struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 262144, 1))
+        self._f.flush()
+
+    def write(self, frame):
+        t = time.time()
+        sec = int(t)
+        self._f.write(struct.pack("<IIII", sec, int((t - sec) * 1e6), len(frame), len(frame)) + frame)
+        self._f.flush()
+
+    def close(self):
+        self._f.close()
 
 
 class UdpSink:
