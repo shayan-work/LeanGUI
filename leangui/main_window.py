@@ -28,8 +28,8 @@ from .widgets.info_panel import DemodStatusPanel
 from .widgets.sdr_panel import SdrConfigPanel
 from .widgets.source_selector import SourceSelector
 from .widgets.spectrum_plot import SpectrumPlotWidget
-from .widgets.udp_panel import UdpOutputPanel
-from .udp_out import MODE_OFF, UdpOutputConfig
+from .widgets.packet_panel import PacketOutputPanel
+from .debuglog import DebugLog
 from .widgets.video_panel import VideoPanelWidget
 
 DEFAULT_IQ_FILE = ""
@@ -58,6 +58,7 @@ class MainWindow(QMainWindow):
         # True while the user has explicitly released the bladeRF; blocks
         # every automatic capture (re)start until they click Reacquire.
         self._sdr_released = False
+        self._debug_log = None  # DebugLog for the current decode run
         self._updating_tuning_ui = False
         # Latest chunk handed off by the SDR fan-out thread, redrawn at a
         # fixed cadence by spectrum_timer instead of on every arrival - see
@@ -87,9 +88,13 @@ class MainWindow(QMainWindow):
 
         self.control_bar = ControlBar(available_chains())
         main_layout.addWidget(self.control_bar)
+        # This build is for data, not video: preselect the GSE/IP data chain.
+        _idx = self.control_bar.chain_combo.findData(LeanDVBGSEChain.display_name)
+        if _idx >= 0:
+            self.control_bar.chain_combo.setCurrentIndex(_idx)
 
-        self.udp_panel = UdpOutputPanel()
-        main_layout.addWidget(self.udp_panel)
+        self.packet_panel = PacketOutputPanel()
+        main_layout.addWidget(self.packet_panel)
 
         self.spectrum_plot = SpectrumPlotWidget()
         self.constellation_plot = ConstellationPlotWidget()
@@ -189,16 +194,34 @@ class MainWindow(QMainWindow):
         chain.encryption_detected.connect(self.video_panel.set_encrypted)
 
         try:
-            udp_cfg = self.udp_panel.config()
-        except ValueError:
-            if self.udp_panel.mode() != MODE_OFF:
-                QMessageBox.warning(self, "Invalid output setting", "UDP needs host:port (e.g. 127.0.0.1:5000); PCAP needs a file path.")
-                return None
-            udp_cfg = UdpOutputConfig()  # UDP off: a blank/odd address doesn't matter
-        if hasattr(chain, "udp_config"):
-            chain.udp_config = udp_cfg
-        elif udp_cfg is not None and udp_cfg.mode != MODE_OFF:
-            self.info_panel.append_debug("UDP output is only available in the GSE/IP data chain.")
+            out_cfg = self.packet_panel.config()
+        except ValueError as e:
+            QMessageBox.warning(self, "Invalid output setting", str(e))
+            return None
+        if hasattr(chain, "out_config"):
+            chain.out_config = out_cfg
+        elif out_cfg.enabled():
+            self.info_panel.append_debug("Packet output is only available in the GSE/IP data chain.")
+
+        # Debug log: [TIMESTAMP]_[CENTERFREQ]_[SYMBOLRATE].txt. A recorded
+        # file has no RF center frequency in the GUI, so that part is "NA".
+        center_hz = None
+        if source.kind == "fifo":
+            try:
+                center_hz = float(self.sdr_panel.freq_edit.text().strip()) * 1e6
+            except ValueError:
+                pass
+        self._close_debug_log()
+        self._debug_log = DebugLog(center_hz, tuning.symbol_rate_hz, header_lines=[
+            f"chain: {chain_name}",
+            f"source: {source.kind} {source.path} ({source.sample_format})",
+            f"center_freq_hz: {center_hz if center_hz is not None else 'NA'}",
+            f"symbol_rate_hz: {tuning.symbol_rate_hz}  sample_rate_hz: {tuning.sample_rate_hz}  "
+            f"offset_hz: {tuning.offset_hz}  rolloff: {tuning.rolloff}",
+        ])
+        chain.debug_line.connect(self._debug_log.write)
+        chain.error.connect(lambda m, log=self._debug_log: log.write("ERROR: " + m.replace("\n", " | ")))
+        self.info_panel.append_debug(f"Debug log: {self._debug_log.path}")
 
         self.gse_text_panel.clear()
         self.gse_text_panel.setVisible(False)
@@ -214,6 +237,8 @@ class MainWindow(QMainWindow):
         if chain.is_running():
             self.active_chain = chain
             self.control_bar.set_decoding_active(True)
+        else:
+            self._close_debug_log()
         return chain
 
     def _on_gse_text_chunk(self, flow_key, text):
@@ -314,6 +339,7 @@ class MainWindow(QMainWindow):
         if self.active_chain:
             self.active_chain.stop()
             self.active_chain = None
+            self._close_debug_log()
             self.control_bar.set_decoding_active(False)
         if self.sdr_source:
             self.sdr_source.stop()
@@ -348,10 +374,16 @@ class MainWindow(QMainWindow):
     def _on_chain_error(self, message):
         QMessageBox.critical(self, "Process Error", message)
 
+    def _close_debug_log(self):
+        if self._debug_log is not None:
+            self._debug_log.close()
+            self._debug_log = None
+
     def stop_decoding(self):
         if self.active_chain:
-            self.active_chain.stop()
+            self.active_chain.stop()  # emits its final summary lines before closing the log below
             self.active_chain = None
+        self._close_debug_log()
         self.info_panel.reset()
         self.control_bar.set_decoding_active(False)
 

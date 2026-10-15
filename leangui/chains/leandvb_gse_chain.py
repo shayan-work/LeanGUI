@@ -21,7 +21,7 @@ from PySide6.QtCore import Signal
 from .leandvb_chain import LeanDVBChain, _mpv_embed_target_id
 from .registry import register_chain
 from ..gse.reader import GSEReader
-from ..udp_out import MODE_BBF, MODE_GSE, MODE_PCAP, BbframeUdpThread, PcapWriter, UdpOutputConfig, UdpSink
+from ..packet_out import SRC_BBF, SRC_GSE, BbframeReader, PacketOutput, PacketOutputConfig
 
 
 @register_chain
@@ -38,18 +38,17 @@ class LeanDVBGSEChain(LeanDVBChain):
     def __init__(self, video_widget=None, parent=None):
         super().__init__(video_widget, parent)
         self.gse_reader_thread = None
-        #: set by the GUI before start(); see udp_out.UdpOutputConfig
-        self.udp_config = UdpOutputConfig()
-        self._udp_sink = None
-        self._pcap = None
-        self.bbf_udp_thread = None
+        #: set by the GUI before start(); see packet_out.PacketOutputConfig
+        self.out_config = PacketOutputConfig()
+        self._output = None  # PacketOutput, created once per run (survives relaunches)
+        self.bbf_reader_thread = None
 
     def _build_cmd(self, source, tuning, w_fd, info_w_fd, gse_w_fd, bbf_w_fd=None):
         cmd = super()._build_cmd(source, tuning, w_fd, info_w_fd)
         cmd += ['--fd-gse', f"{gse_w_fd}"]
         if bbf_w_fd is not None:
             cmd += ['--fd-bbf', f"{bbf_w_fd}"]
-            if self.udp_config.bbf_l3sync:
+            if self.out_config.l3sync_effective():
                 cmd.append('--bbf-l3sync')
         return cmd
 
@@ -65,23 +64,22 @@ class LeanDVBGSEChain(LeanDVBChain):
         self.debug_line.emit(
             f"DVB-S2: acquiring lock, MODCOD auto-detected from PL header (attempt {self._attempt_num})..."
         )
-        if self.udp_config.mode == MODE_PCAP and self._pcap is None:
+        if self.out_config.enabled() and self._output is None:
             try:
-                self._pcap = PcapWriter(self.udp_config.pcap_path)
+                self._output = PacketOutput(self.out_config)
             except OSError as e:
-                self.error.emit(f"Cannot open PCAP file:\n{e}")
+                self.error.emit(f"Cannot open packet output:\n{e}")
                 self.stop()
                 return
+            self.debug_line.emit(f"Packet output: {self.out_config.describe()}")
         r_fd, w_fd = os.pipe()
         info_r_fd, info_w_fd = os.pipe()
         gse_r_fd, gse_w_fd = os.pipe()
         bbf_r_fd = bbf_w_fd = None
-        if self.udp_config.mode in (MODE_GSE, MODE_BBF):
-            if self._udp_sink is None:
-                self._udp_sink = UdpSink(self.udp_config.host, self.udp_config.port)
-            if self.udp_config.mode == MODE_BBF:
-                bbf_r_fd, bbf_w_fd = os.pipe()
+        if self._output is not None and self.out_config.source == SRC_BBF:
+            bbf_r_fd, bbf_w_fd = os.pipe()
         cmd = self._build_cmd(self._source, self._tuning, w_fd, info_w_fd, gse_w_fd, bbf_w_fd)
+        self.debug_line.emit("leandvb command: " + " ".join(cmd))
 
         try:
             # No TS ever reaches leandvb's stdout in GSE mode (it's DEVNULL
@@ -98,8 +96,9 @@ class LeanDVBGSEChain(LeanDVBChain):
             self._spawn_readers(r_fd, info_r_fd)
             self._spawn_gse_reader(gse_r_fd)
             if bbf_r_fd is not None:
-                self.bbf_udp_thread = BbframeUdpThread(bbf_r_fd, self._udp_sink, self.udp_config.bbf_l3sync)
-                self.bbf_udp_thread.start()
+                self.bbf_reader_thread = BbframeReader(bbf_r_fd, self._output)
+                self.bbf_reader_thread.summary.connect(self.debug_line)
+                self.bbf_reader_thread.start()
         except Exception as e:
             self.error.emit(f"Failed to start leandvb:\n{str(e)}")
             self.stop()
@@ -108,6 +107,32 @@ class LeanDVBGSEChain(LeanDVBChain):
         if self.ENABLE_LOCK_WATCHDOG:
             self._attempt_deadline = time.monotonic() + self.LOCK_ACQUIRE_TIMEOUT_MS / 1000.0
             self._lock_acquire_timer.start(500)
+
+    def _produced_real_ts_output(self):
+        # The base class counts TS bytes from a recorder thread, which this
+        # chain doesn't have (stdout is DEVNULL), so it always answered
+        # "no output". A recorded file that reached EOF after locking was
+        # then misread as a false lock and replayed from the top, up to
+        # MAX_LOCK_ATTEMPTS times. Count GSE bytes instead.
+        r = self.gse_reader_thread
+        return r is not None and r.bytes_in > 0
+
+    def _on_lock_failure(self):
+        """A recorded file is deterministic: replaying it from the top gives
+        byte-identical output (this is what produced six copies of every
+        packet before). Only live sources are ever retried."""
+        if self._source is not None and self._source.kind == "file":
+            self._lock_acquire_timer.stop()
+            self._lock_confirm_timer.stop()
+            self._lock_stability_timer.stop()
+            self._health_check_timer.stop()
+            self._lock_confirmed = False
+            self.debug_line.emit(
+                "Lock lost/not achieved on a recorded file - not retrying "
+                "(replaying the same samples would give identical output).")
+            self.status_update.emit({"lock": False})
+            return
+        super()._on_lock_failure()
 
     def _relaunch_attempt(self):
         # Unlike the base class, our mpv (if running at all) isn't wired to
@@ -137,8 +162,8 @@ class LeanDVBGSEChain(LeanDVBChain):
         self._lock_stability_timer.start(self.LOCK_STABLE_MS)
 
     def _spawn_gse_reader(self, gse_r_fd):
-        sink = self._udp_sink if self.udp_config.mode == MODE_GSE else None
-        self.gse_reader_thread = GSEReader(gse_r_fd, udp_sink=sink, pcap_writer=self._pcap)
+        out = self._output if self.out_config.source == SRC_GSE else None
+        self.gse_reader_thread = GSEReader(gse_r_fd, output=out)
         self.gse_reader_thread.flow_update.connect(self.gse_flow_update)
         self.gse_reader_thread.text_chunk.connect(self.gse_text_chunk)
         self.gse_reader_thread.video_chunk.connect(self._on_video_chunk)
@@ -178,18 +203,16 @@ class LeanDVBGSEChain(LeanDVBChain):
             self.gse_reader_thread.stop()
             self.gse_reader_thread.wait()
             self.gse_reader_thread = None
-        if self.bbf_udp_thread:
-            self.bbf_udp_thread.stop()
-            self.bbf_udp_thread.wait()
-            self.bbf_udp_thread = None
+        if self.bbf_reader_thread:
+            self.bbf_reader_thread.stop()
+            self.bbf_reader_thread.wait()
+            self.bbf_reader_thread = None
 
     def stop(self):
         super().stop()
         # Closed only on a real stop, not on a lock-watchdog relaunch, so
-        # the socket survives _teardown_process() -> _start_attempt().
-        if self._udp_sink is not None:
-            self._udp_sink.close()
-            self._udp_sink = None
-        if self._pcap is not None:
-            self._pcap.close()
-            self._pcap = None
+        # the socket / pcap file survive _teardown_process() -> _start_attempt().
+        if self._output is not None:
+            self.debug_line.emit(self._output.summary())
+            self._output.close()
+            self._output = None

@@ -11,7 +11,7 @@ from PySide6.QtCore import QThread, Signal
 
 from . import decap as gd
 from .flows import classify_frame, flow_key_str, sniff_content, strip_rtp_if_present
-from ..udp_out import GseItemSplitter
+from ..packet_out import GseItemSplitter
 
 READ_CHUNK = 65536
 
@@ -55,11 +55,11 @@ class GSEReader(QThread):
     #: as DecodeChain.debug_line).
     debug_line = Signal(str)
 
-    def __init__(self, read_fd, parent=None, udp_sink=None, pcap_writer=None):
+    def __init__(self, read_fd, parent=None, output=None):
         super().__init__(parent)
         self.read_fd = read_fd
-        self.udp_sink = udp_sink  # optional: gets each raw GSE item as one datagram
-        self.pcap_writer = pcap_writer  # optional: gets each reassembled Ethernet frame
+        self.output = output  # optional packet_out.PacketOutput (UDP / PCAP)
+        self.bytes_in = 0  # raw bytes read from leandvb's --fd-gse; lets the chain tell a clean EOF from a false lock
         self.running = True
 
     def stop(self):
@@ -79,18 +79,19 @@ class GSEReader(QThread):
                     break
                 if not chunk:
                     break  # leandvb exited / pipe closed
+                self.bytes_in += len(chunk)
 
                 out_frames = []
                 # Whole items only; zero padding is skipped (decap_one_item
                 # alone never consumed it, so the old loop stalled there).
                 for item in splitter.feed(chunk):
-                    if self.udp_sink is not None:
-                        self.udp_sink.send(item)
+                    if self.output is not None:
+                        self.output.raw(item)
                     gd.decap_one_item(gd.BitReader(item), frag_table, out_frames, stats)
 
-                if self.pcap_writer is not None:
+                if self.output is not None:
                     for frame in out_frames:
-                        self.pcap_writer.write(frame)
+                        self.output.frame(frame)
                 for frame in out_frames:
                     self._handle_frame(frame, flows)
                 if out_frames:
