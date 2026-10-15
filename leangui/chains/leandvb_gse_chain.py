@@ -16,7 +16,7 @@ import os
 import subprocess
 import time
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QTimer, Signal
 
 from .leandvb_chain import LeanDVBChain, _mpv_embed_target_id
 from .registry import register_chain
@@ -42,6 +42,20 @@ class LeanDVBGSEChain(LeanDVBChain):
         self.out_config = PacketOutputConfig()
         self._output = None  # PacketOutput, created once per run (survives relaunches)
         self.bbf_reader_thread = None
+        # Live sources are retried forever; this paces the relaunches.
+        self._relaunch_timer = QTimer(self)
+        self._relaunch_timer.setSingleShot(True)
+        self._relaunch_timer.timeout.connect(self._relaunch_attempt)
+
+    def _is_live(self):
+        return self._source is not None and self._source.kind == "fifo"
+
+    @staticmethod
+    def _live_retry_delay_ms(n):
+        # Immediate for the first two retries (fast recovery from a brief
+        # loss), then 0.5 s doubling up to 5 s so a leandvb that dies
+        # instantly can't spin the CPU. Reset by _on_lock_stable.
+        return 0 if n <= 2 else min(500 * 2 ** (n - 3), 5000)
 
     def _build_cmd(self, source, tuning, w_fd, info_w_fd, gse_w_fd, bbf_w_fd=None):
         cmd = super()._build_cmd(source, tuning, w_fd, info_w_fd)
@@ -75,9 +89,10 @@ class LeanDVBGSEChain(LeanDVBChain):
         r_fd, w_fd = os.pipe()
         info_r_fd, info_w_fd = os.pipe()
         gse_r_fd, gse_w_fd = os.pipe()
-        bbf_r_fd = bbf_w_fd = None
-        if self._output is not None and self.out_config.source == SRC_BBF:
-            bbf_r_fd, bbf_w_fd = os.pipe()
+        # Always request the BBFRAME dump: it feeds the monitor (stream type,
+        # CCM/ACM, ISI, frame counts) and the 'is it really decoding' check,
+        # and - when selected as the output source - the packet output.
+        bbf_r_fd, bbf_w_fd = os.pipe()
         cmd = self._build_cmd(self._source, self._tuning, w_fd, info_w_fd, gse_w_fd, bbf_w_fd)
         self.debug_line.emit("leandvb command: " + " ".join(cmd))
 
@@ -91,14 +106,15 @@ class LeanDVBGSEChain(LeanDVBChain):
             # place - there's no "show whatever leandvb produces" case to
             # guard against here the way there is for the base chain.
             self._spawn_leandvb(self._source, cmd, w_fd, info_w_fd,
-                                 extra_pass_fds=[gse_w_fd] + ([bbf_w_fd] if bbf_w_fd is not None else []),
+                                 extra_pass_fds=[gse_w_fd, bbf_w_fd],
                                  stdout=subprocess.DEVNULL)
             self._spawn_readers(r_fd, info_r_fd)
             self._spawn_gse_reader(gse_r_fd)
-            if bbf_r_fd is not None:
-                self.bbf_reader_thread = BbframeReader(bbf_r_fd, self._output)
-                self.bbf_reader_thread.summary.connect(self.debug_line)
-                self.bbf_reader_thread.start()
+            out = self._output if self.out_config.source == SRC_BBF else None
+            self.bbf_reader_thread = BbframeReader(bbf_r_fd, out)
+            self.bbf_reader_thread.status.connect(self.debug_line)
+            self.bbf_reader_thread.summary.connect(self.debug_line)
+            self.bbf_reader_thread.start()
         except Exception as e:
             self.error.emit(f"Failed to start leandvb:\n{str(e)}")
             self.stop()
@@ -114,8 +130,11 @@ class LeanDVBGSEChain(LeanDVBChain):
         # "no output". A recorded file that reached EOF after locking was
         # then misread as a false lock and replayed from the top, up to
         # MAX_LOCK_ATTEMPTS times. Count GSE bytes instead.
-        r = self.gse_reader_thread
-        return r is not None and r.bytes_in > 0
+        # Anything decoded counts: GSE bytes, or a BBFRAME of any stream
+        # type (a TS or packetized stream never reaches --fd-gse, but it is
+        # still a real decode, not a false lock).
+        g, b = self.gse_reader_thread, self.bbf_reader_thread
+        return (g is not None and g.bytes_in > 0) or (b is not None and b.frames_seen > 0)
 
     def _on_lock_failure(self):
         """A recorded file is deterministic: replaying it from the top gives
@@ -132,7 +151,45 @@ class LeanDVBGSEChain(LeanDVBChain):
                 "(replaying the same samples would give identical output).")
             self.status_update.emit({"lock": False})
             return
+        if self._is_live():
+            # Never give up on a live signal: no attempt cap, no "exhausted"
+            # state. leandvb re-detects by itself; this only restarts it
+            # after a crash, a false lock, or a long stretch without lock.
+            self._lock_acquire_timer.stop()
+            self._lock_confirm_timer.stop()
+            self._lock_stability_timer.stop()
+            self._health_check_timer.stop()
+            self._lock_confirmed = False
+            self._lock_attempt += 1
+            delay = self._live_retry_delay_ms(self._lock_attempt)
+            self.debug_line.emit(
+                f"Live source: lock lost/not achieved - restarting leandvb "
+                f"(retry #{self._lock_attempt}, no retry limit"
+                + (f", waiting {delay / 1000:.1f}s" if delay else "") + ").")
+            self.status_update.emit({"lock": False})
+            self._relaunch_timer.start(delay)
+            return
         super()._on_lock_failure()
+
+    def _check_process_health(self):
+        # The base class treats "exited cleanly after locking" as a normal
+        # end of input. For a live source that is never normal.
+        if self._is_live() and self.leandvb_process is not None and self.leandvb_process.poll() is not None:
+            self.debug_line.emit(
+                f"leandvb exited (code {self.leandvb_process.returncode}) on a live source - restarting.")
+            self._on_lock_failure()
+            return
+        super()._check_process_health()
+
+    def _check_lock_acquire_deadline(self):
+        # Don't wait out the full acquire timeout if leandvb already died.
+        if (self._is_live() and not self._lock_confirmed and self.leandvb_process is not None
+                and self.leandvb_process.poll() is not None):
+            self.debug_line.emit(
+                f"leandvb exited (code {self.leandvb_process.returncode}) before locking - restarting.")
+            self._on_lock_failure()
+            return
+        super()._check_lock_acquire_deadline()
 
     def _relaunch_attempt(self):
         # Unlike the base class, our mpv (if running at all) isn't wired to
@@ -209,6 +266,7 @@ class LeanDVBGSEChain(LeanDVBChain):
             self.bbf_reader_thread = None
 
     def stop(self):
+        self._relaunch_timer.stop()  # a pending live retry must not fire after an intentional stop
         super().stop()
         # Closed only on a real stop, not on a lock-watchdog relaunch, so
         # the socket / pcap file survive _teardown_process() -> _start_attempt().

@@ -246,29 +246,45 @@ def split_data_field(data):
 
 
 class BbframeReader(QThread):
-    """Reads leandvb's --fd-bbf pipe. Raw level forwards each BBFRAME as-is;
-    pdu / eth levels de-encapsulate generic-continuous (GSE) BBFRAMEs with the
-    same decap code the GUI's flow analysis uses. Only unblocks (EOF) once
-    leandvb exits - the chain's teardown kills leandvb before joining."""
+    """Reads leandvb's --fd-bbf pipe. Always runs as a monitor (counts frames,
+    reports stream type / CCM-ACM / ISI from the BBHEADER). If an output is
+    attached it also forwards: raw level sends each BBFRAME as-is; pdu / eth
+    levels de-encapsulate generic-continuous (GSE) BBFRAMEs with the same
+    decap code the GUI's flow analysis uses. Only unblocks (EOF) once
+    leandvb exits - the chain's teardown kills leandvb before joining.
 
-    summary = Signal(str)
+    BBHEADER bits, as leandvb itself decodes them (dvbs2.h, s2_deframer):
+    byte0 = stream type (2 bits: 0 GP, 1 GC, 3 TS) | SIS(0x20; clear = MIS)
+    | CCM(0x10; clear = ACM/VCM) | ISSYI | NPD | roll-off; byte1 = ISI."""
 
-    def __init__(self, read_fd, output: PacketOutput, parent=None):
+    summary = Signal(str)  # one line at EOF
+    status = Signal(str)   # events + periodic window stats while running
+
+    MONITOR_PERIOD_S = 10.0
+
+    def __init__(self, read_fd, output: PacketOutput = None, parent=None):
         super().__init__(parent)
         self.read_fd = read_fd
         self.output = output
         self.running = True
+        self.frames_seen = 0  # lets the chain tell "locked and decoding" from a false lock
 
     def stop(self):
         self.running = False
 
     def run(self):
-        cfg = self.output.cfg
-        splitter = BbframeSplitter(cfg.l3sync_effective())
-        prefix = 1 if cfg.l3sync_effective() else 0
+        cfg = self.output.cfg if self.output is not None else None
+        l3 = cfg.l3sync_effective() if cfg is not None else False
+        splitter = BbframeSplitter(l3)
+        prefix = 1 if l3 else 0
         frag_table = {}
         stats = defaultdict(int)
         counts = Counter()
+        window = Counter()
+        window_isis = set()
+        window_start = time.monotonic()
+        seen_isis = set()
+        last_ccm = None
         try:
             while self.running:
                 try:
@@ -278,25 +294,47 @@ class BbframeReader(QThread):
                 if not chunk:
                     break
                 for bbf in splitter.feed(chunk):
+                    self.frames_seen += 1
                     counts["bbframes"] += 1
-                    self.output.raw(bbf)
-                    if cfg.level == LVL_RAW:
-                        continue
                     body = bbf[prefix:]
-                    st = body[0] >> 6
-                    counts[STREAM_TYPE_NAMES[st]] += 1
-                    if st != 1:
-                        continue  # TS / packetized streams are not GSE
-                    dfl = ((body[4] << 8) | body[5]) // 8
-                    items, overran = split_data_field(body[BBH_LEN:BBH_LEN + dfl])
-                    if overran:
-                        counts["gse_item_ran_past_data_field"] += 1
-                    for item in items:
-                        out_frames = []
-                        gd.decap_one_item(gd.BitReader(item), frag_table, out_frames, stats)
-                        for f in out_frames:
-                            self.output.frame(f)
-                    gd.prune_stale_fragments(frag_table, 5.0)
+                    b0 = body[0]
+                    st = b0 >> 6
+                    ccm, sis, isi = bool(b0 & 0x10), bool(b0 & 0x20), body[1]
+                    name = STREAM_TYPE_NAMES[st]
+                    counts[name] += 1
+                    window[name] += 1
+                    window["ACM" if not ccm else "CCM"] += 1
+                    if not sis:
+                        window_isis.add(isi)
+                        if isi not in seen_isis:
+                            seen_isis.add(isi)
+                            self.status.emit(f"BBFRAME: multiple input streams - ISI {isi} first seen")
+                    if ccm != last_ccm:
+                        self.status.emit("BBFRAME: " + ("CCM (constant coding & modulation)" if ccm
+                                                        else "ACM/VCM (BBHEADER CCM bit is clear)"))
+                        last_ccm = ccm
+
+                    if self.output is not None:
+                        self.output.raw(bbf)
+                        if cfg.level != LVL_RAW and st == 1:
+                            dfl = ((body[4] << 8) | body[5]) // 8
+                            items, overran = split_data_field(body[BBH_LEN:BBH_LEN + dfl])
+                            if overran:
+                                counts["gse_item_ran_past_data_field"] += 1
+                            for item in items:
+                                out_frames = []
+                                gd.decap_one_item(gd.BitReader(item), frag_table, out_frames, stats)
+                                for f in out_frames:
+                                    self.output.frame(f)
+                            gd.prune_stale_fragments(frag_table, 5.0)
+
+                now = time.monotonic()
+                if now - window_start >= self.MONITOR_PERIOD_S and window:
+                    dt = now - window_start
+                    kinds = ", ".join(f"{k}={v}" for k, v in sorted(window.items()))
+                    isis = f"; ISIs {sorted(window_isis)}" if window_isis else ""
+                    self.status.emit(f"BBFRAMEs in last {dt:.0f}s: {kinds}{isis}")
+                    window.clear(); window_isis = set(); window_start = now
         finally:
             try:
                 os.close(self.read_fd)
